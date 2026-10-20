@@ -37,6 +37,8 @@ docker compose up -d --build
 
 数据（SQLite 数据库与图片缓存）保存在 `./data`。容器以 `PUID`/`PGID`（默认 1000）运行，启动时会自动修正数据目录权限。
 
+生产服务器上的 x86-64 预构建包支持固定安装目录、正式安装和后续一条命令升级，见 [deploy/DEPLOY.zh-CN.md](deploy/DEPLOY.zh-CN.md)。
+
 ### 常用环境变量
 
 | 变量 | 默认值 | 说明 |

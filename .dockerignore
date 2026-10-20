@@ -1,9 +1,11 @@
 target/
 dist/
 data/
+**/data/
 data-*/
 .git/
 .env
+**/.env
 .env.*
 !.env.example
 *.db

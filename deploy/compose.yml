@@ -1,0 +1,31 @@
+name: rillrss
+
+services:
+  rillrss:
+    image: rillrss:0.1.1-amd64
+    platform: linux/amd64
+    container_name: rillrss
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${RILL_PORT:-8080}:8080"
+    environment:
+      RILL_USERNAME: ${RILL_USERNAME:-admin}
+      RILL_PASSWORD: ${RILL_PASSWORD:?Set RILL_PASSWORD in .env before starting}
+      RILL_BASE_URL: ${RILL_BASE_URL:?Set RILL_BASE_URL in .env, for example https://rss.example.com}
+      RILL_TRUST_PROXY: ${RILL_TRUST_PROXY:-true}
+      RILL_ALLOW_PRIVATE_NETWORKS: ${RILL_ALLOW_PRIVATE_NETWORKS:-false}
+      RILL_TRANSLATE_BASE_URL: ${RILL_TRANSLATE_BASE_URL:-}
+      RILL_TRANSLATE_API_KEY: ${RILL_TRANSLATE_API_KEY:-}
+      RILL_TRANSLATE_MODEL: ${RILL_TRANSLATE_MODEL:-}
+      RILL_LOG: ${RILL_LOG:-info}
+      TZ: ${TZ:-Asia/Kuala_Lumpur}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    volumes:
+      - ./data:/data
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

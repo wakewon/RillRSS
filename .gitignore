@@ -7,8 +7,9 @@
 /dist/
 **/*.rs.bk
 
-# Runtime data directory (SQLite DB, image cache, icons, backups ...)
-/data/
+# Runtime data directories (SQLite DB, image cache, icons, backups ...), at any
+# depth, e.g. deploy/data/ after running Compose inside deploy/
+data/
 /data-*/
 /rill-data/
 /var/
