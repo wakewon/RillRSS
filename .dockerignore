@@ -1,0 +1,14 @@
+target/
+data/
+data-*/
+.git/
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite*
+*.log
+scratch/
+tests/live-output/
+docker-compose.override.yml
