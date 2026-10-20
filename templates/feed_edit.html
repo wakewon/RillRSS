@@ -7,7 +7,7 @@
     {% if feed.has_icon %}<img class="favicon lg" src="/feed-icons/{{ feed.id }}.ico" alt="">{% else %}<span class="favicon letter lg">{{ feed.initial }}</span>{% endif %}
     <div style="min-width:0">
       <h1 class="ellipsis">{{ feed.title }}{% if !feed.enabled %} <span class="badge warn" style="vertical-align:4px">已停用</span>{% endif %}</h1>
-      <div class="sub ellipsis"><a href="{{ feed.url }}" rel="noreferrer" target="_blank">{{ feed.url }}</a>{% if !feed.site_url.is_empty() %} · <a href="{{ feed.site_url }}" rel="noreferrer" target="_blank">网站</a>{% endif %}</div>
+      <div class="sub ellipsis">{% if let Some(h) = feed.url_link %}<a href="{{ h }}" rel="noreferrer" target="_blank">{{ feed.url }}</a>{% else %}{{ feed.url }}{% endif %}{% if let Some(h) = feed.site_link %} · <a href="{{ h }}" rel="noreferrer" target="_blank">网站</a>{% endif %}</div>
     </div>
   </div>
   <div class="actions">
@@ -22,7 +22,7 @@
   <div class="stat"><div class="label">未读</div><div class="value">{{ feed.unread }}</div><div class="foot">共 {{ feed.items }} 篇</div></div>
   <div class="stat"><div class="label">新闻条目</div><div class="value">{{ feed.stories }}</div><div class="foot">新闻更新 {{ feed.versions }} 次</div></div>
   <div class="stat"><div class="label">处理中</div><div class="value">{{ feed.pending }}</div><div class="foot">{% if feed.failed > 0 %}<span class="err">失败 {{ feed.failed }}</span>{% else %}无失败{% endif %}</div></div>
-  <div class="stat"><div class="label">上次抓取</div><div class="value sm"><time datetime="{{ feed.last_fetch.iso }}">{{ feed.last_fetch.text }}</time></div><div class="foot">HTTP {{ feed.last_status }} · {{ feed.duration }} ms · 下次 {{ feed.next_fetch }}</div></div>
+  <div class="stat"><div class="label">上次抓取</div><div class="value sm"><time datetime="{{ feed.last_fetch.iso }}">{{ feed.last_fetch.text }}</time></div><div class="foot">HTTP {{ feed.last_status }} · {{ feed.duration }} ms{% if let Some(n) = feed.next_fetch %} · 下次 {{ n }}{% endif %}</div></div>
 </div>
 
 <div class="grid-side">

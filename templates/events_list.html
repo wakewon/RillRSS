@@ -5,7 +5,7 @@
   <span class="dot {{ e.level_class }}"></span>
   <div>
     <div class="msg">{{ e.message }}</div>
-    <div class="meta"><span>{{ e.kind_label }}</span>{% if let Some(fid) = e.feed_id %}<a href="/admin/feeds/{{ fid }}">{{ e.feed_title }}</a>{% endif %}{% if let Some(iid) = e.item_id %}<a href="/admin/items/{{ iid }}">文章 #{{ iid }}</a>{% endif %}</div>
+    <div class="meta"><span>{{ e.kind_label }}</span>{% if let Some(fid) = e.feed_id %}{% if let Some(t) = e.feed_title %}<a href="/admin/feeds/{{ fid }}">{{ t }}</a>{% else %}<span>订阅 #{{ fid }}（已删除）</span>{% endif %}{% endif %}{% if let Some(iid) = e.item_id %}{% if e.item_exists %}<a href="/admin/items/{{ iid }}">文章 #{{ iid }}</a>{% else %}<span>文章 #{{ iid }}（已删除）</span>{% endif %}{% endif %}</div>
   </div>
   <time datetime="{{ e.time.iso }}">{{ e.time.text }}</time>
 </li>

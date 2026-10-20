@@ -30,7 +30,7 @@
         <div style="min-width:0"><a class="t ellipsis {% if i.read %}read{% endif %}" style="display:block" href="/admin/items/{{ i.id }}">{{ i.title }}</a><div class="sub ellipsis">{{ i.feed }} · #{{ i.id }}</div></div>
       </div>
     </td>
-    <td><div class="badges">{% if !i.read %}<span class="badge accent">未读</span>{% endif %}{% if i.starred %}<span class="badge warn">★ 收藏</span>{% endif %}{% if i.version > 1 %}<span class="badge ok">v{{ i.version }}</span>{% endif %}{% if let Some(s) = i.superseded_by %}<a class="badge" href="/admin/items/{{ s }}" title="已被 #{{ s }} 取代">旧版</a>{% endif %}</div></td>
+    <td><div class="badges">{% if !i.read %}<span class="badge accent">未读</span>{% endif %}{% if i.starred %}<span class="badge warn">★ 收藏</span>{% endif %}{% if i.version > 1 %}<span class="badge ok">v{{ i.version }}</span>{% endif %}{% if let Some(s) = i.superseded_by %}{% if i.newer_exists %}<a class="badge" href="/admin/items/{{ s }}" title="已被 #{{ s }} 取代">旧版</a>{% else %}<span class="badge" title="较新的版本 #{{ s }} 已删除">旧版</span>{% endif %}{% endif %}</div></td>
     <td class="hide-sm small text-2 nowrap"><time datetime="{{ i.published.iso }}" data-local>{{ i.published.text }}</time></td>
     <td class="hide-sm small text-2 nowrap"><time datetime="{{ i.created.iso }}" data-local>{{ i.created.text }}</time></td>
   </tr>

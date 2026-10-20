@@ -6,7 +6,8 @@
 <div class="grid-side">
   <div class="card">
     <div class="card-head"><h3>导入</h3></div>
-    <form method="post" action="/admin/opml/import?csrf={{ base.csrf }}" enctype="multipart/form-data" class="stack-sm">
+    <form method="post" action="/admin/opml/import" enctype="multipart/form-data" class="stack-sm">
+      <input type="hidden" name="csrf" value="{{ base.csrf }}">
       <div class="field"><label for="opml_file">OPML 文件</label><input type="file" id="opml_file" name="file" accept=".opml,.xml,text/xml,application/xml"></div>
       <div class="field"><label for="opml_text">或粘贴 OPML 内容</label><textarea id="opml_text" name="text" rows="6" placeholder="&lt;opml version=&quot;2.0&quot;&gt; …"></textarea></div>
       <div class="help">已存在的订阅会跳过；嵌套的 outline 作为分类导入。RillRSS 导出的 OPML 还会恢复每个订阅的处理选项。</div>

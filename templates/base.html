@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="light dark">
 <title>{% block title %}RillRSS{% endblock %} · RillRSS</title>
-<script>try{var t=localStorage.getItem('rill-theme');if(t){document.documentElement.setAttribute('data-theme',t)}}catch(e){}</script>
+<script nonce="{{ base.nonce }}">try{var t=localStorage.getItem('rill-theme');if(t){document.documentElement.setAttribute('data-theme',t)}}catch(e){}</script>
 <style>{{ base.css|safe }}</style>
 </head>
 <body>
@@ -37,7 +37,7 @@
     {% block content %}{% endblock %}
   </div></main>
 </div>
-<script>
+<script nonce="{{ base.nonce }}">
 document.addEventListener('submit', function (e) {
   var q = e.target.getAttribute('data-confirm');
   if (q && !window.confirm(q)) { e.preventDefault(); }

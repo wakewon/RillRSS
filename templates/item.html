@@ -5,7 +5,7 @@
 <div class="page-head">
   <div style="min-width:0">
     <h1>{{ it.title }}</h1>
-    <div class="sub">#{{ it.id }} · v{{ it.version }} · 发布于 <time datetime="{{ it.published.iso }}" data-local>{{ it.published.text }}</time>{% if !it.link.is_empty() %} · <a href="{{ it.link }}" rel="noreferrer" target="_blank">原文 <svg class="icon sm"><use href="#i-external"/></svg></a>{% endif %}</div>
+    <div class="sub">#{{ it.id }} · v{{ it.version }} · 发布于 <time datetime="{{ it.published.iso }}" data-local>{{ it.published.text }}</time>{% if let Some(h) = it.link %} · <a href="{{ h }}" rel="noreferrer" target="_blank">原文 <svg class="icon sm"><use href="#i-external"/></svg></a>{% endif %}</div>
   </div>
   <div class="actions">
     {% if let Some(sid) = it.story_id %}
@@ -13,7 +13,7 @@
     {% endif %}
   </div>
 </div>
-{% if let Some(s) = it.superseded_by %}<div class="flash warn"><svg class="icon"><use href="#i-layers"/></svg><div>这是旧版本，已被 <a href="/admin/items/{{ s }}">#{{ s }}</a> 取代。</div></div>{% endif %}
+{% if let Some(s) = it.superseded_by %}<div class="flash warn"><svg class="icon"><use href="#i-layers"/></svg><div>这是旧版本，已被 {% if it.newer_exists %}<a href="/admin/items/{{ s }}">#{{ s }}</a>{% else %}#{{ s }}（已删除）{% endif %} 取代。</div></div>{% endif %}
 <div class="grid-side">
   <article class="reader">{{ it.content|safe }}</article>
   <div class="stack">

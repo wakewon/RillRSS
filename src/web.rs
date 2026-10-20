@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use askama::Template;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Multipart, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -60,7 +60,7 @@ pub fn router() -> Router<AppRef> {
         .route("/admin/tools/translate", post(tool_translate))
         .route("/admin/tools/feed", post(tool_feed))
         .route("/admin/opml", get(opml_page))
-        .route("/admin/opml/import", post(opml_import))
+        .route("/admin/opml/import", post(opml_import).layer(DefaultBodyLimit::max(OPML_MAX_BYTES)))
         .route("/admin/opml/export", get(opml_export))
         .route("/admin/account", get(account_page))
         .route("/admin/account/password", post(account_password))
@@ -75,6 +75,8 @@ pub fn router() -> Router<AppRef> {
 #[derive(Clone)]
 pub struct Base {
     pub csrf: String,
+    /// Nonce of this response's inline scripts (see `render`).
+    pub nonce: String,
     pub nav: &'static str,
     pub version: &'static str,
     pub css: &'static str,
@@ -129,22 +131,65 @@ fn to_login() -> Response {
     Redirect::to("/admin/login").into_response()
 }
 
-fn render<T: Template>(t: T) -> Response {
+/// A fresh nonce for one response's inline scripts.
+fn script_nonce() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
+/// An admin page. Its inline scripts carry `nonce()`; the CSP runs no other script,
+/// so markup that slips into a page (or a `javascript:` link) cannot execute.
+trait Page: Template {
+    fn nonce(&self) -> &str;
+}
+
+macro_rules! pages {
+    ($($t:ty),* $(,)?) => {
+        $(impl Page for $t {
+            fn nonce(&self) -> &str {
+                &self.base.nonce
+            }
+        })*
+    };
+}
+
+pages!(DashboardT, FeedsT, FeedT, CategoriesT, ItemsT, ItemT, TasksT, EventsT, SettingsT, ToolsT, OpmlT, AccountT);
+
+impl Page for LoginT {
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+fn render<T: Page>(t: T) -> Response {
     match t.render() {
         Ok(html) => {
+            // Styles stay inline on purpose (see CSS); scripts need the nonce.
+            let csp = format!(
+                "default-src 'self'; img-src * data:; style-src 'self' 'unsafe-inline'; script-src 'nonce-{}'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                t.nonce()
+            );
             let mut r = Html(html).into_response();
             let h = r.headers_mut();
             h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
             h.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
-            h.insert(
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static("default-src 'self'; img-src * data:; style-src 'self' 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; form-action 'self'"),
-            );
+            h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&csp).unwrap_or(HeaderValue::from_static("default-src 'none'")));
             r
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("template error: {e}")).into_response(),
     }
+}
+
+/// `s` as an absolute http(s) URL. Feed and article addresses come from feeds,
+/// OPML files and forms; only these schemes are stored or turned into links.
+fn http_url(s: &str) -> Option<url::Url> {
+    url::Url::parse(s.trim()).ok().filter(|u| matches!(u.scheme(), "http" | "https") && u.has_host())
+}
+
+/// Link target for an external address, or None to show it as text only (e.g. a
+/// `javascript:` URL imported from an OPML file).
+fn web_link(s: &str) -> Option<String> {
+    http_url(s).map(|u| u.to_string())
 }
 
 fn server_error(e: anyhow::Error) -> Response {
@@ -159,7 +204,7 @@ struct FlashQuery {
 }
 
 fn base(s: &Session, nav: &'static str, q: &FlashQuery) -> Base {
-    Base { csrf: s.csrf.clone(), nav, version: VERSION, css: CSS, flash: q.msg.clone(), error: q.err.clone() }
+    Base { csrf: s.csrf.clone(), nonce: script_nonce(), nav, version: VERSION, css: CSS, flash: q.msg.clone(), error: q.err.clone() }
 }
 
 fn redirect_msg(path: &str, msg: &str) -> Response {
@@ -249,6 +294,7 @@ fn iso(ts: Option<i64>) -> String {
 #[template(path = "login.html")]
 struct LoginT {
     css: &'static str,
+    nonce: String,
     username: String,
     error: Option<String>,
 }
@@ -257,7 +303,7 @@ async fn login_page(State(app): State<AppRef>, headers: HeaderMap) -> Response {
     if session(&app, &headers).await.is_some() {
         return Redirect::to("/admin").into_response();
     }
-    render(LoginT { css: CSS, username: app.cfg.username.clone(), error: None })
+    render(LoginT { css: CSS, nonce: script_nonce(), username: app.cfg.username.clone(), error: None })
 }
 
 async fn login_post(State(app): State<AppRef>, headers: HeaderMap, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
@@ -265,7 +311,7 @@ async fn login_post(State(app): State<AppRef>, headers: HeaderMap, ConnectInfo(p
     let user = form.get("username").unwrap_or("").to_string();
     let pass = form.get("password").unwrap_or("");
     let ip = client_ip(&app, &headers, Some(peer));
-    let fail = |msg: &str| render(LoginT { css: CSS, username: user.clone(), error: Some(msg.to_string()) });
+    let fail = |msg: &str| render(LoginT { css: CSS, nonce: script_nonce(), username: user.clone(), error: Some(msg.to_string()) });
     if !auth::begin_login(&app, ip) {
         return fail("尝试次数过多，请 15 分钟后再试。");
     }
@@ -348,8 +394,11 @@ pub struct EventRow {
     pub level_class: &'static str,
     pub kind_label: &'static str,
     pub feed_id: Option<i64>,
-    pub feed_title: String,
+    /// None when the feed has been deleted since (no link then).
+    pub feed_title: Option<String>,
     pub item_id: Option<i64>,
+    /// The article still exists (cleanup may have removed it since).
+    pub item_exists: bool,
     pub message: String,
 }
 
@@ -400,7 +449,10 @@ fn reason_label(reason: &str) -> &'static str {
 }
 
 fn load_events(c: &rusqlite::Connection, feed: Option<i64>, level: &str, kind: &str, limit: i64) -> anyhow::Result<Vec<EventRow>> {
-    let mut sql = String::from("SELECT e.ts, e.level, e.kind, e.feed_id, COALESCE(f.title, ''), e.item_id, e.message FROM events e LEFT JOIN feeds f ON f.id = e.feed_id WHERE 1");
+    let mut sql = String::from(
+        "SELECT e.ts, e.level, e.kind, e.feed_id, f.title, e.item_id, EXISTS (SELECT 1 FROM items i WHERE i.id = e.item_id), e.message
+         FROM events e LEFT JOIN feeds f ON f.id = e.feed_id WHERE 1",
+    );
     let mut p: Vec<rusqlite::types::Value> = Vec::new();
     if let Some(f) = feed {
         sql.push_str(" AND e.feed_id = ?");
@@ -420,6 +472,7 @@ fn load_events(c: &rusqlite::Connection, feed: Option<i64>, level: &str, kind: &
     let mut st = c.prepare(&sql)?;
     let rows = st.query_map(rusqlite::params_from_iter(p), |r| {
         let level: String = r.get(1)?;
+        let feed_id: Option<i64> = r.get(3)?;
         Ok(EventRow {
             time: Ts::rel(r.get(0)?),
             level_class: match level.as_str() {
@@ -428,10 +481,13 @@ fn load_events(c: &rusqlite::Connection, feed: Option<i64>, level: &str, kind: &
                 _ => "",
             },
             kind_label: kind_label(&r.get::<_, String>(2)?),
-            feed_id: r.get(3)?,
-            feed_title: r.get(4)?,
+            feed_id,
+            feed_title: r
+                .get::<_, Option<String>>(4)?
+                .map(|t| if t.trim().is_empty() { format!("订阅 #{}", feed_id.unwrap_or_default()) } else { t }),
             item_id: r.get(5)?,
-            message: r.get(6)?,
+            item_exists: r.get(6)?,
+            message: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -698,7 +754,8 @@ struct FeedDetail {
     has_icon: bool,
     enabled: bool,
     url: String,
-    site_url: String,
+    url_link: Option<String>,
+    site_link: Option<String>,
     unread: i64,
     items: i64,
     stories: i64,
@@ -706,7 +763,8 @@ struct FeedDetail {
     pending: i64,
     failed: i64,
     last_fetch: Ts,
-    next_fetch: String,
+    /// None while the feed is disabled.
+    next_fetch: Option<String>,
     last_status: String,
     duration: String,
     error: String,
@@ -846,6 +904,18 @@ fn feed_sections(f: &fetcher::FeedRow, enabled: bool, category: Option<i64>, cat
     ]
 }
 
+/// When a feed is fetched next. A due feed (`next_fetch_at` is 0 after adding it or
+/// "refresh") waits for the scheduler; a disabled one is not fetched at all.
+fn next_fetch_label(enabled: bool, next_fetch_at: i64) -> String {
+    if !enabled {
+        "已停用".into()
+    } else if next_fetch_at <= util::now() {
+        "排队中".into()
+    } else {
+        fmt_relative(Some(next_fetch_at))
+    }
+}
+
 async fn feed_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path<i64>, Query(q): Query<FlashQuery>) -> Response {
     let s = guard_get!(app, headers);
     let res = app
@@ -866,8 +936,9 @@ async fn feed_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
                 initial: initial(&f.title),
                 has_icon: one("SELECT EXISTS (SELECT 1 FROM feed_icons WHERE feed_id = ? AND length(data) > 0)")? != 0,
                 enabled: enabled != 0,
+                url_link: web_link(&f.url),
                 url: f.url.clone(),
-                site_url: site.unwrap_or_default(),
+                site_link: site.as_deref().and_then(web_link),
                 unread: one("SELECT COUNT(*) FROM items WHERE feed_id = ? AND is_read = 0 AND hidden = 0")?,
                 items: one("SELECT COUNT(*) FROM items WHERE feed_id = ?")?,
                 stories: one("SELECT COUNT(*) FROM stories WHERE feed_id = ?")?,
@@ -875,7 +946,7 @@ async fn feed_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
                 pending: one("SELECT COUNT(*) FROM revisions WHERE feed_id = ? AND state = 'pending'")?,
                 failed: one("SELECT COUNT(*) FROM revisions WHERE feed_id = ? AND state = 'failed'")?,
                 last_fetch: Ts::rel(last_fetch),
-                next_fetch: if enabled == 0 { "已停用".into() } else { fmt_relative(Some(next_fetch.max(1))) },
+                next_fetch: (enabled != 0).then(|| next_fetch_label(true, next_fetch)),
                 last_status: status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
                 duration: dur.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
                 error: err.unwrap_or_default(),
@@ -978,8 +1049,8 @@ async fn feed_save(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
     let category = form.get("category").and_then(|c| c.parse::<i64>().ok());
     let interval = form.get("fetch_interval").and_then(|c| c.trim().parse::<i64>().ok()).filter(|i| *i > 0);
     let enabled = form.get("enabled").is_some();
-    if url::Url::parse(&url).is_err() {
-        return redirect_err(&format!("/admin/feeds/{id}"), "订阅地址无效");
+    if http_url(&url).is_none() {
+        return redirect_err(&format!("/admin/feeds/{id}"), "订阅地址无效（仅支持 http / https）");
     }
     let title_changed = title != feed.title;
     let res = app
@@ -1166,6 +1237,8 @@ struct ItemRowV {
     has_icon: bool,
     version: i64,
     superseded_by: Option<i64>,
+    /// The newer version still exists (cleanup may have removed it).
+    newer_exists: bool,
     read: bool,
     starred: bool,
     published: Ts,
@@ -1206,7 +1279,8 @@ async fn items_page(State(app): State<AppRef>, headers: HeaderMap, Query(iq): Qu
         .call(move |c| {
             let mut sql = String::from(
                 "SELECT i.id, i.title, f.title, i.version, i.superseded_by, i.is_read, i.is_starred, i.published_at, i.created_at, f.id,
-                        EXISTS (SELECT 1 FROM feed_icons fi WHERE fi.feed_id = f.id AND length(fi.data) > 0)
+                        EXISTS (SELECT 1 FROM feed_icons fi WHERE fi.feed_id = f.id AND length(fi.data) > 0),
+                        EXISTS (SELECT 1 FROM items n WHERE n.id = i.superseded_by)
                  FROM items i JOIN feeds f ON f.id = i.feed_id WHERE 1",
             );
             let mut p: Vec<rusqlite::types::Value> = Vec::new();
@@ -1246,6 +1320,7 @@ async fn items_page(State(app): State<AppRef>, headers: HeaderMap, Query(iq): Qu
                         created: Ts::abs(Some(r.get::<_, i64>(8)? / 1_000_000)),
                         feed_id: r.get(9)?,
                         has_icon: r.get::<_, i64>(10)? != 0,
+                        newer_exists: r.get(11)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1282,13 +1357,16 @@ struct ItemDetail {
     title: String,
     feed_id: i64,
     feed: String,
-    link: String,
+    /// The original article, when it is an http(s) address.
+    link: Option<String>,
     version: i64,
     read: bool,
     starred: bool,
     published: Ts,
     created: Ts,
     superseded_by: Option<i64>,
+    /// The newer version still exists (cleanup may have removed it).
+    newer_exists: bool,
     story_id: Option<i64>,
     content: String,
 }
@@ -1339,6 +1417,10 @@ async fn item_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
                 )
                 .optional()?;
             let Some((title, feed, link, version, published, created, sup, story, content, feed_id, read, starred)) = row else { return Ok(None) };
+            let newer_exists = match sup {
+                Some(n) => c.query_row("SELECT EXISTS (SELECT 1 FROM items WHERE id = ?)", [n], |r| r.get(0))?,
+                None => false,
+            };
             let mut versions = Vec::new();
             let mut revisions = Vec::new();
             if let Some(sid) = story {
@@ -1389,13 +1471,14 @@ async fn item_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
                     title,
                     feed_id,
                     feed,
-                    link: link.unwrap_or_default(),
+                    link: link.as_deref().and_then(web_link),
                     version,
                     read: read != 0,
                     starred: starred != 0,
                     published: Ts::abs(Some(published)),
                     created: Ts::abs(Some(created / 1_000_000)),
                     superseded_by: sup,
+                    newer_exists,
                     story_id: story,
                     content,
                 },
@@ -1418,6 +1501,12 @@ async fn story_reprocess(State(app): State<AppRef>, headers: HeaderMap, Path(id)
     let form = Form::parse(&body);
     let _s = guard_post!(app, headers, form);
     let back = form.get("item").and_then(|i| i.parse::<i64>().ok()).map(|i| format!("/admin/items/{i}")).unwrap_or_else(|| "/admin/tasks".into());
+    // The story may be gone (its feed deleted) while the page was open.
+    match app.db.call(move |c| Ok(c.query_row("SELECT EXISTS (SELECT 1 FROM stories WHERE id = ?)", [id], |r| r.get::<_, bool>(0))?)).await {
+        Ok(true) => {}
+        Ok(false) => return redirect_err(&back, "该新闻已不存在，无法重新处理。"),
+        Err(e) => return server_error(e),
+    }
     match crate::pipeline::reprocess_story(&app, id).await {
         Ok(true) => redirect_msg(&back, "已安排重新处理，完成后以新版本发布（保留已读与收藏状态）。"),
         Ok(false) => redirect_err(&back, "没有可重新处理的源数据。"),
@@ -1496,9 +1585,11 @@ async fn tasks_page(State(app): State<AppRef>, headers: HeaderMap, Query(q): Que
                  FROM revisions r JOIN feeds f ON f.id = r.feed_id WHERE r.state = 'failed' ORDER BY r.id DESC LIMIT 100",
                 false,
             )?;
-            let mut st = c.prepare("SELECT id, title, fetch_error_count, COALESCE(last_error, ''), next_fetch_at FROM feeds WHERE fetch_error_count > 0 ORDER BY fetch_error_count DESC")?;
+            let mut st = c.prepare(
+                "SELECT id, title, fetch_error_count, COALESCE(last_error, ''), next_fetch_at, enabled FROM feeds WHERE fetch_error_count > 0 ORDER BY fetch_error_count DESC",
+            )?;
             let feed_errors = st
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, fmt_relative(Some(r.get::<_, i64>(4)?)))))?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, next_fetch_label(r.get::<_, i64>(5)? != 0, r.get(4)?))))?
                 .collect::<Result<Vec<_>, _>>()?;
             let pending_total: i64 = c.query_row("SELECT COUNT(*) FROM revisions WHERE state = 'pending'", [], |r| r.get(0))?;
             let failed_total: i64 = c.query_row("SELECT COUNT(*) FROM revisions WHERE state = 'failed'", [], |r| r.get(0))?;
@@ -1735,9 +1826,28 @@ async fn settings_save(State(app): State<AppRef>, headers: HeaderMap, body: Byte
     if !new.translation.extra_body.trim().is_empty() && serde_json::from_str::<serde_json::Map<String, Value>>(&new.translation.extra_body).is_err() {
         return redirect_err("/admin/settings", "附加请求参数必须是 JSON 对象");
     }
+    for (label, url) in [("公开访问地址", &new.base_url), ("外部提取服务地址", &new.fulltext.external_url), ("翻译 API 地址", &new.translation.base_url)] {
+        if !url.trim().is_empty() && http_url(url).is_none() {
+            return redirect_err("/admin/settings", &format!("{label}无效（仅支持 http / https）"));
+        }
+    }
+    // The public URL is pasted into article HTML (cached image addresses).
+    if new.base_url.contains(|c: char| c.is_whitespace() || "\"'<>`".contains(c)) {
+        return redirect_err("/admin/settings", "公开访问地址不能包含空格或引号");
+    }
     match app.settings.save(new).await {
         Ok(_) => {
             app.translator.reset_circuit();
+            // Translations put off while the service was failing (breaker, back-off)
+            // run now with the new settings.
+            let now = util::now();
+            let resumed = app
+                .db
+                .call(move |c| Ok(c.execute("UPDATE revisions SET next_attempt_at = 0 WHERE state = 'pending' AND stage = 'translate' AND next_attempt_at > ?", [now])?))
+                .await;
+            if let Err(e) = resumed {
+                tracing::warn!("admin: resume translations: {e:#}");
+            }
             app.wake_fetcher.notify_one();
             app.wake_pipeline.notify_one();
             redirect_msg("/admin/settings", "设置已保存并立即生效。已发布的文章不会自动改变，可在「任务」页按订阅批量重新处理。")
@@ -1904,27 +2014,37 @@ async fn opml_page(State(app): State<AppRef>, headers: HeaderMap, Query(q): Quer
     render(OpmlT { base: base(&s, "feeds", &q) })
 }
 
-#[derive(serde::Deserialize)]
-struct CsrfQuery {
-    csrf: Option<String>,
-}
+/// Largest OPML upload; this route raises the server-wide request body limit.
+const OPML_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-async fn opml_import(State(app): State<AppRef>, headers: HeaderMap, Query(cq): Query<CsrfQuery>, mut mp: Multipart) -> Response {
+async fn opml_import(State(app): State<AppRef>, headers: HeaderMap, mut mp: Multipart) -> Response {
     let Some(s) = session(&app, &headers).await else { return to_login() };
-    if cq.csrf.as_deref().is_none_or(|c| !auth::ct_eq(c, &s.csrf)) {
-        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
-    }
-    let mut data: Vec<u8> = Vec::new();
-    while let Ok(Some(field)) = mp.next_field().await {
+    // The CSRF token is a form field as everywhere else, never part of the URL.
+    let (mut csrf, mut file, mut text) = (None, Bytes::new(), Bytes::new());
+    loop {
+        let field = match mp.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => return redirect_err("/admin/opml", &format!("上传失败（OPML 最大 16 MB）：{e}")),
+        };
         let name = field.name().unwrap_or("").to_string();
-        if let Ok(bytes) = field.bytes().await
-            && !bytes.iter().all(|b| b.is_ascii_whitespace())
-            && (name == "file" || (name == "text" && data.is_empty()))
-        {
-            data = bytes.to_vec();
+        let bytes = match field.bytes().await {
+            Ok(b) => b,
+            Err(e) => return redirect_err("/admin/opml", &format!("上传失败（OPML 最大 16 MB）：{e}")),
+        };
+        match name.as_str() {
+            "csrf" => csrf = Some(String::from_utf8_lossy(&bytes).into_owned()),
+            "file" => file = bytes,
+            "text" => text = bytes,
+            _ => {}
         }
     }
-    if data.is_empty() {
+    if csrf.as_deref().is_none_or(|c| !auth::ct_eq(c, &s.csrf)) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token, please reload the page").into_response();
+    }
+    let blank = |b: &[u8]| b.iter().all(|c| c.is_ascii_whitespace());
+    let data = if blank(&file) { text } else { file };
+    if blank(&data) {
         return redirect_err("/admin/opml", "请选择文件或粘贴 OPML 内容。");
     }
     match crate::opml::import(&app, &data).await {
@@ -2050,5 +2170,22 @@ mod tests {
         assert_eq!(s.updates.page_check_minutes, vec![10, 20, 30]);
         assert_eq!(s.translation.model, "gpt-x");
         assert_eq!(s.fetch.timeout_secs, 30);
+    }
+
+    #[test]
+    fn only_http_urls_become_links() {
+        assert_eq!(web_link(" https://Example.com ").as_deref(), Some("https://example.com/"));
+        assert_eq!(web_link("http://127.0.0.1:8080/feed.xml").as_deref(), Some("http://127.0.0.1:8080/feed.xml"));
+        for bad in ["javascript:alert(1)", "JavaScript:alert(1)", "java\tscript:alert(1)", " javascript:alert(1)", "data:text/html,x", "ftp://example.com/", "mailto:a@example.com", "/relative", ""] {
+            assert_eq!(web_link(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn next_fetch_labels() {
+        assert_eq!(next_fetch_label(false, 0), "已停用");
+        assert_eq!(next_fetch_label(true, 0), "排队中");
+        assert_eq!(next_fetch_label(true, util::now() - 60), "排队中");
+        assert_eq!(next_fetch_label(true, util::now() + 2 * 3600 + 30), "2 小时后");
     }
 }
