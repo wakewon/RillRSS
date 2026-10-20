@@ -267,6 +267,80 @@ impl Default for UpdateSettings {
     }
 }
 
+impl Settings {
+    /// Clamp every value to a sane range (applied when settings are loaded and saved):
+    /// out-of-range numbers would overflow time arithmetic or disable safety checks.
+    pub fn clamp(&mut self) {
+        let f = &mut self.fetch;
+        f.default_interval_min = f.default_interval_min.clamp(1, 43_200);
+        f.min_interval_min = f.min_interval_min.clamp(1, 1440);
+        f.concurrency = f.concurrency.clamp(1, 64);
+        f.per_host_concurrency = f.per_host_concurrency.clamp(1, 32);
+        f.per_host_delay_ms = f.per_host_delay_ms.min(60_000);
+        f.page_concurrency = f.page_concurrency.clamp(1, 32);
+        f.timeout_secs = f.timeout_secs.clamp(5, 600);
+        f.max_feed_mb = f.max_feed_mb.clamp(1, 500);
+        f.max_page_mb = f.max_page_mb.clamp(1, 200);
+        f.initial_items = f.initial_items.min(100_000);
+        f.max_entry_age_days = f.max_entry_age_days.min(MAX_DAYS);
+        f.max_backoff_hours = f.max_backoff_hours.clamp(1, 24 * 30);
+
+        let r = &mut self.retention;
+        r.days = r.days.min(MAX_DAYS);
+        r.max_items_per_feed = r.max_items_per_feed.min(10_000_000);
+        r.superseded_days = r.superseded_days.min(MAX_DAYS);
+        r.translation_cache_days = r.translation_cache_days.min(MAX_DAYS);
+        r.event_rows = r.event_rows.clamp(100, 10_000_000);
+
+        // 0 would accept an empty extraction as the article.
+        self.fulltext.min_text_chars = self.fulltext.min_text_chars.clamp(1, 1_000_000);
+
+        let t = &mut self.translation;
+        t.max_concurrency = t.max_concurrency.clamp(1, 16);
+        t.requests_per_minute = t.requests_per_minute.min(1_000_000);
+        t.timeout_secs = t.timeout_secs.clamp(5, 3600);
+        if !t.temperature.is_finite() {
+            t.temperature = TranslationSettings::default().temperature;
+        }
+        t.temperature = t.temperature.clamp(-1.0, 2.0);
+        t.max_batch_chars = t.max_batch_chars.clamp(200, 200_000);
+        t.max_batch_segments = t.max_batch_segments.clamp(1, 500);
+        t.max_tokens = t.max_tokens.min(10_000_000);
+        t.max_attempts = t.max_attempts.clamp(1, 100);
+        if t.on_failure != "hold" && t.on_failure != "publish_original" {
+            t.on_failure = TranslationSettings::default().on_failure;
+        }
+
+        let i = &mut self.images;
+        i.max_mb = i.max_mb.clamp(1, 200);
+        i.max_per_article = i.max_per_article.clamp(1, 1000);
+        i.max_total_mb = i.max_total_mb.min(100_000_000);
+        i.timeout_secs = i.timeout_secs.clamp(5, 600);
+        i.concurrency = i.concurrency.clamp(1, 16);
+        i.min_dimension = i.min_dimension.min(10_000);
+
+        let u = &mut self.updates;
+        u.min_interval_min = u.min_interval_min.min(10_080 * 4);
+        u.max_versions = u.max_versions.min(10_000);
+        u.track_hours = u.track_hours.min(24 * MAX_DAYS);
+        for m in u.page_check_minutes.iter_mut() {
+            *m = (*m).min(60 * 24 * MAX_DAYS);
+        }
+        u.page_check_minutes.sort_unstable();
+        u.page_check_minutes.truncate(100);
+        if !u.min_change_ratio.is_finite() {
+            u.min_change_ratio = UpdateSettings::default().min_change_ratio;
+        }
+        u.min_change_ratio = u.min_change_ratio.clamp(0.0, 1.0);
+        u.min_changed_tokens = u.min_changed_tokens.min(1_000_000);
+        // 0 would make every change (even none) a "new paragraph".
+        u.major_added_tokens = u.major_added_tokens.clamp(1, 1_000_000);
+    }
+}
+
+/// Upper bound for day counts (100 years); keeps `days * 86400 * 1e6` far from overflow.
+pub const MAX_DAYS: u32 = 36_500;
+
 impl UpdateSettings {
     pub fn thresholds(&self) -> crate::util::text::ChangeThresholds {
         crate::util::text::ChangeThresholds {
@@ -361,7 +435,9 @@ impl Default for FeedOptions {
 
 impl FeedOptions {
     pub fn from_json(s: &str) -> FeedOptions {
-        serde_json::from_str(s).unwrap_or_default()
+        let mut o: FeedOptions = serde_json::from_str(s).unwrap_or_default();
+        o.retention_days = o.retention_days.map(|d| d.min(MAX_DAYS));
+        o
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
@@ -417,6 +493,7 @@ impl SettingsStore {
                 if s.translation.model.is_empty() && !cfg.translate_model.is_empty() {
                     s.translation.model = cfg.translate_model.clone();
                 }
+                s.clamp();
                 Ok(s)
             })
             .await?;
@@ -427,7 +504,8 @@ impl SettingsStore {
         self.inner.read().await.clone()
     }
 
-    pub async fn save(&self, s: Settings) -> Result<()> {
+    pub async fn save(&self, mut s: Settings) -> Result<()> {
+        s.clamp();
         let json = serde_json::to_string(&s)?;
         self.db.call(move |conn| set_raw(conn, SETTINGS_KEY, &json)).await?;
         *self.inner.write().await = Arc::new(s);
@@ -457,5 +535,34 @@ mod tests {
         assert_eq!(s.fetch.concurrency, 3);
         assert_eq!(s.fetch.default_interval_min, 30);
         assert_eq!(s.updates.max_versions, 5);
+    }
+
+    #[test]
+    fn clamp_keeps_defaults_and_bounds_extremes() {
+        let mut d = Settings::default();
+        d.clamp();
+        assert_eq!(d, Settings::default(), "defaults are inside the ranges");
+
+        let mut s = Settings::default();
+        s.retention.days = 999_999_999;
+        s.retention.superseded_days = u32::MAX;
+        s.fulltext.min_text_chars = 0;
+        s.updates.major_added_tokens = 0;
+        s.updates.min_change_ratio = -3.0;
+        s.updates.page_check_minutes = vec![240, 30, 30, u32::MAX];
+        s.translation.on_failure = "whatever".into();
+        s.translation.max_attempts = 0;
+        s.fetch.timeout_secs = 0;
+        s.clamp();
+        assert_eq!(s.retention.days, MAX_DAYS);
+        assert_eq!(s.retention.superseded_days, MAX_DAYS);
+        assert_eq!(s.fulltext.min_text_chars, 1);
+        assert_eq!(s.updates.major_added_tokens, 1);
+        assert_eq!(s.updates.min_change_ratio, 0.0);
+        assert_eq!(s.updates.page_check_minutes, vec![30, 30, 240, 60 * 24 * MAX_DAYS]);
+        assert_eq!(s.translation.on_failure, "publish_original");
+        assert_eq!(s.translation.max_attempts, 1);
+        assert_eq!(s.fetch.timeout_secs, 5);
+        assert_eq!(FeedOptions::from_json("{\"retention_days\":4000000000}").retention_days, Some(MAX_DAYS));
     }
 }

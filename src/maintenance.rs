@@ -44,6 +44,16 @@ impl CleanupReport {
     }
 }
 
+/// `now - days` in unix seconds, saturating (day counts come from user settings).
+fn days_ago(now: i64, days: u32) -> i64 {
+    now.saturating_sub((days as i64).saturating_mul(86400))
+}
+
+/// `days_ago` in microseconds (the unit of `items.created_at`).
+fn days_ago_us(now: i64, days: u32) -> i64 {
+    days_ago(now, days).saturating_mul(1_000_000)
+}
+
 pub async fn run_maintenance(app: AppRef) {
     // First run shortly after start, then hourly.
     let mut delay = Duration::from_secs(300);
@@ -90,7 +100,7 @@ pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
             .write(move |tx| {
                 let mut n = 0;
                 if days > 0 {
-                    let cutoff_us = (now - days as i64 * 86400) * 1_000_000;
+                    let cutoff_us = days_ago_us(now, days);
                     n += tx.execute(
                         "DELETE FROM items WHERE feed_id = ? AND created_at < ? AND is_starred = 0 AND (? = 0 OR is_read = 1 OR hidden = 1)",
                         params![feed_id, cutoff_us, keep_unread as i64],
@@ -110,12 +120,15 @@ pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
         report.items_deleted += n;
     }
 
-    // Superseded versions.
-    let sup_cutoff = (now - r.superseded_days as i64 * 86400) * 1_000_000;
-    report.superseded_deleted = app
-        .db
-        .write(move |tx| Ok(tx.execute("DELETE FROM items WHERE hidden = 1 AND superseded_by IS NOT NULL AND is_starred = 0 AND created_at < ?", [sup_cutoff])?))
-        .await?;
+    // Superseded versions (0 = no extra limit: they follow the article retention, like
+    // `days = 0` means "keep").
+    if r.superseded_days > 0 {
+        let sup_cutoff = days_ago_us(now, r.superseded_days);
+        report.superseded_deleted = app
+            .db
+            .write(move |tx| Ok(tx.execute("DELETE FROM items WHERE hidden = 1 AND superseded_by IS NOT NULL AND is_starred = 0 AND created_at < ?", [sup_cutoff])?))
+            .await?;
+    }
 
     // Finished revisions (keep the newest per story: it carries the entry data used for
     // reprocessing and page updates).
@@ -132,7 +145,7 @@ pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
         .await?;
 
     // Stories that left the feed long ago and have no articles left.
-    let story_cutoff = now - (r.days.max(7) as i64 + 7) * 86400;
+    let story_cutoff = days_ago(now, r.days.max(7).saturating_add(7));
     report.stories_deleted = app
         .db
         .write(move |tx| {
@@ -145,17 +158,20 @@ pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
         })
         .await?;
 
-    // Drop change-detection baselines of stories past the update-tracking window.
-    let track = settings.updates.track_hours.max(1) as i64;
-    let baseline_cutoff = now - track * 3600 - 86400;
-    app.db
-        .write(move |tx| {
-            Ok(tx.execute(
-                "UPDATE stories SET source_text = NULL, next_check_at = NULL WHERE first_seen_at < ? AND source_text IS NOT NULL",
-                [baseline_cutoff],
-            )?)
-        })
-        .await?;
+    // Drop change-detection baselines of stories past the update-tracking window
+    // (track_hours = 0 tracks without a time limit: keep them).
+    let track = settings.updates.track_hours as i64;
+    if track > 0 {
+        let baseline_cutoff = now.saturating_sub(track.saturating_mul(3600)).saturating_sub(86400);
+        app.db
+            .write(move |tx| {
+                Ok(tx.execute(
+                    "UPDATE stories SET source_text = NULL, next_check_at = NULL WHERE first_seen_at < ? AND source_text IS NOT NULL",
+                    [baseline_cutoff],
+                )?)
+            })
+            .await?;
+    }
 
     // Image cache.
     let (n, freed) = app.images.gc(86400).await?;
@@ -208,4 +224,19 @@ pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
         })
         .await?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cutoffs_saturate() {
+        let now = 1_800_000_000;
+        assert_eq!(days_ago(now, 1), now - 86400);
+        assert_eq!(days_ago_us(now, 30), (now - 30 * 86400) * 1_000_000);
+        // Absurd day counts give a cutoff far in the past, never a wrapped future one.
+        assert!(days_ago_us(now, 999_999_999) < 0);
+        assert!(days_ago_us(now, u32::MAX) < 0);
+    }
 }

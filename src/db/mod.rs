@@ -9,7 +9,7 @@ use rusqlite::{Connection, OpenFlags};
 
 pub type Pool = r2d2::Pool<SqliteConnectionManager>;
 
-const MIGRATIONS: &[&str] = &[include_str!("../../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("../../migrations/0001_init.sql"), include_str!("../../migrations/0002_pipeline.sql")];
 
 #[derive(Clone)]
 pub struct Db {
@@ -18,6 +18,14 @@ pub struct Db {
 
 fn init_conn(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(Duration::from_secs(15))?;
+    // auto_vacuum can only be chosen before the first page is written, and switching to
+    // WAL writes page 1: on a new file it must come first. (Existing databases are
+    // converted once by `ensure_incremental_vacuum`; setting it on every connection would
+    // write the header and disturb concurrent transactions.)
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    if pages == 0 {
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+    }
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
@@ -52,6 +60,7 @@ impl Db {
         {
             let mut conn = db.pool.get()?;
             migrate(&mut conn)?;
+            ensure_incremental_vacuum(&conn)?;
         }
         Ok(db)
     }
@@ -123,10 +132,6 @@ impl Db {
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if current == 0 {
-        // Must be set before the first table is created; enables incremental_vacuum.
-        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
-    }
     for (idx, sql) in MIGRATIONS.iter().enumerate() {
         let version = (idx + 1) as i64;
         if version <= current {
@@ -138,6 +143,31 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(&format!("PRAGMA user_version = {version}"))?;
         tx.commit()?;
         tracing::info!(version, "applied database migration");
+    }
+    Ok(())
+}
+
+/// Make sure the database uses incremental auto-vacuum (maintenance returns freed pages
+/// to the file system with `PRAGMA incremental_vacuum`). Databases created before WAL was
+/// switched on after auto_vacuum have mode NONE: convert them once with VACUUM (runs
+/// outside a transaction; works in WAL mode).
+fn ensure_incremental_vacuum(conn: &Connection) -> Result<()> {
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode == 2 {
+        return Ok(());
+    }
+    tracing::info!(mode, "converting the database to incremental auto-vacuum (one-time VACUUM)");
+    let started = std::time::Instant::now();
+    if let Err(e) = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;") {
+        // E.g. not enough free disk space for the copy: keep running, retry next start.
+        tracing::warn!("auto-vacuum conversion failed: {e}");
+        return Ok(());
+    }
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode == 2 {
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "database now uses incremental auto-vacuum");
+    } else {
+        tracing::warn!(mode, "auto_vacuum is still not incremental after VACUUM");
     }
     Ok(())
 }
@@ -176,5 +206,59 @@ mod tests {
         db.backup_to(&dest).unwrap();
         let copy = Db::open(&dest).unwrap();
         assert_eq!(copy.integrity_check().unwrap(), "ok");
+    }
+
+    fn auto_vacuum(db: &Db) -> i64 {
+        db.conn().unwrap().query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn new_databases_use_incremental_auto_vacuum_in_wal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        assert_eq!(auto_vacuum(&db), 2);
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(auto_vacuum(&db), 2, "sticks after reopening");
+        let mode: String = db.conn().unwrap().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn existing_databases_are_converted_to_incremental_auto_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Layout of databases created by earlier versions: WAL first, auto_vacuum NONE.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            c.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
+            // A full-text feed with one article from the page and one from a fallback.
+            c.execute_batch(
+                "INSERT INTO feeds (id, url, options, created_at, updated_at) VALUES (1, 'u', '{\"fulltext\":\"readability\"}', 0, 0), (2, 'v', 'not json', 0, 0);
+                 INSERT INTO stories (id, feed_id, guid, first_seen_at, last_seen_at, version, current_item_id) VALUES (1, 1, 'a', 0, 0, 2, 1), (2, 1, 'b', 0, 0, 1, 2), (3, 2, 'c', 0, 0, 1, 3);
+                 INSERT INTO revisions (id, story_id, feed_id, reason, state, stage, guid, title, notes, created_at, updated_at) VALUES
+                     (1, 1, 1, 'new', 'published', 'done', 'a', 'A', '[]', 0, 0),
+                     (2, 2, 1, 'new', 'published', 'done', 'b', 'B', '[\"全文提取失败：HTTP 404\"]', 0, 0);
+                 INSERT INTO items (id, feed_id, story_id, revision_id, guid, title, content, published_at, updated_at, created_at) VALUES
+                     (1, 1, 1, 1, 'a', 'A', '', 0, 0, 0), (2, 1, 2, 2, 'b', 'B', '', 0, 0, 0), (3, 2, 3, NULL, 'c', 'C', '', 0, 0, 0);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            let mode: i64 = c.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+            assert_eq!(mode, 0);
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(auto_vacuum(&db), 2);
+        let mode: String = db.conn().unwrap().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(db.integrity_check().unwrap(), "ok");
+        let rows: Vec<(i64, i64, i64)> = {
+            let c = db.conn().unwrap();
+            let mut st = c.prepare("SELECT id, from_page, news_versions FROM stories ORDER BY id").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(rows, vec![(1, 1, 2), (2, 0, 1), (3, 0, 1)], "provenance and news versions backfilled");
     }
 }
