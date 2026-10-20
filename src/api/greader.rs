@@ -549,10 +549,12 @@ async fn client_login(app: &AppRef, p: &Params, headers: &HeaderMap, peer: Socke
         return Ok(text(StatusCode::BAD_REQUEST, "Bad Request!"));
     };
     let ip = client_ip(app, headers, Some(peer));
-    if !auth::api_login(app, user, pass, ip).await? {
+    let Some(cred) = auth::api_login(app, user, &[pass], ip).await? else {
         return Ok(unauthorized());
-    }
-    let t = auth::greader_token(app).await?;
+    };
+    // Bound to the credential that matched: if the password changed meanwhile, the
+    // token is already invalid.
+    let t = auth::greader_token_for(app, &cred).await?;
     let mut r = text(StatusCode::OK, &format!("SID={t}\nLSID=null\nAuth={t}\n"));
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(r)

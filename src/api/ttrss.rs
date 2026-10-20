@@ -325,24 +325,25 @@ async fn login(app: &AppRef, req: &Req, seq: Value, headers: &HeaderMap, peer: S
         _ => req.str("password"),
     };
     let ip = client_ip(app, headers, Some(peer));
-    let mut ok = auth::api_login(app, &user, &password, ip).await?;
-    if !ok && !auth::login_blocked(app, ip) {
-        // Very old clients sent the password base64-encoded.
-        if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, password.trim())
-            && let Ok(p) = String::from_utf8(decoded)
-        {
-            ok = auth::api_login(app, &user, &p, ip).await?;
-        }
-    }
-    if !ok {
+    // Very old clients sent the password base64-encoded.
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, password.trim())
+        .ok()
+        .and_then(|d| String::from_utf8(d).ok())
+        .filter(|p| *p != password);
+    let mut candidates = vec![password.as_str()];
+    candidates.extend(decoded.as_deref());
+    let Some(cred) = auth::api_login(app, &user, &candidates, ip).await? else {
         return Ok(err(seq, "LOGIN_ERROR"));
-    }
+    };
     let old = req.str("sid");
     if !old.is_empty() {
         let _ = auth::delete_session(app, &old).await;
     }
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    let sid = auth::create_session(app, "ttrss", Some(std::time::Duration::from_secs(SESSION_TTL_SECS)), ua, ip).await?;
+    let ttl = Some(std::time::Duration::from_secs(SESSION_TTL_SECS));
+    let Some(sid) = auth::create_session(app, "ttrss", ttl, ua, ip, auth::Cred::Api, cred).await? else {
+        return Ok(err(seq, "LOGIN_ERROR"));
+    };
     let mut content = Map::new();
     content.insert("session_id".into(), json!(sid));
     content.insert("config".into(), config(app).await?);

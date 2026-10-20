@@ -69,44 +69,69 @@ pub fn username_matches(app: &App, user: &str) -> bool {
     user.trim().eq_ignore_ascii_case(app.cfg.username.trim())
 }
 
-/// Verify the admin password.
-pub async fn verify_password(app: &App, password: &str) -> Result<bool> {
-    let hash = app.db.call(|c| get_raw(c, KEY_PASSWORD)).await?;
-    let password = password.to_string();
-    Ok(tokio::task::spawn_blocking(move || hash.is_some_and(|h| verify_hash(&password, &h))).await?)
+/// Argon2 needs about 19 MiB per check and runs on the blocking pool; a few slots
+/// keep a flood of login attempts from exhausting memory.
+static PASSWORD_CHECKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// A stored credential a password can be checked against.
+#[derive(Debug, Clone, Copy)]
+pub enum Cred {
+    /// The admin password (web admin).
+    Admin,
+    /// What API clients log in with: the API password when set, else the admin password.
+    Api,
 }
 
-/// Verify a password presented by an API client: the API password when one is set,
-/// otherwise the admin password.
-pub async fn verify_api_password(app: &App, password: &str) -> Result<bool> {
-    let api = app.db.call(|c| get_raw(c, KEY_API_PASSWORD)).await?;
-    match api {
-        Some(h) => {
-            let password = password.to_string();
-            Ok(tokio::task::spawn_blocking(move || verify_hash(&password, &h)).await?)
+impl Cred {
+    /// SQL expression yielding the stored hash.
+    fn sql(self) -> &'static str {
+        match self {
+            Cred::Admin => "(SELECT value FROM settings WHERE key = 'auth.password_hash')",
+            Cred::Api => {
+                "COALESCE((SELECT value FROM settings WHERE key = 'auth.api_password_hash'), \
+                 (SELECT value FROM settings WHERE key = 'auth.password_hash'))"
+            }
         }
-        None => verify_password(app, password).await,
     }
+}
+
+async fn stored_hash(app: &App, cred: Cred) -> Result<Option<String>> {
+    let sql = format!("SELECT {}", cred.sql());
+    app.db.call(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?)).await
+}
+
+/// Check a password; returns the hash it matched, so that a token or session can be
+/// bound to exactly that credential (a concurrent password change then voids it).
+pub async fn check_password(app: &App, cred: Cred, password: &str) -> Result<Option<String>> {
+    let Some(hash) = stored_hash(app, cred).await? else { return Ok(None) };
+    let _slot = PASSWORD_CHECKS.acquire().await?;
+    let (password, h) = (password.to_string(), hash.clone());
+    let ok = tokio::task::spawn_blocking(move || verify_hash(&password, &h)).await?;
+    Ok(ok.then_some(hash))
+}
+
+/// Verify the admin password.
+pub async fn verify_password(app: &App, password: &str) -> Result<bool> {
+    Ok(check_password(app, Cred::Admin, password).await?.is_some())
+}
+
+fn derive_greader_token(secret: &str, cred: &str) -> String {
+    let key = blake3::derive_key("rillrss greader token v1", secret.as_bytes());
+    blake3::keyed_hash(&key, cred.as_bytes()).to_hex()[..48].to_string()
 }
 
 /// Long-lived Google Reader auth token. Derived from the server secret and the current
 /// API credential hash, so it stays valid across logins (clients like Capy store the
 /// token instead of the password) and changes automatically when the password changes.
 pub async fn greader_token(app: &App) -> Result<String> {
-    let (secret, cred) = app
-        .db
-        .call(|c| {
-            let secret = get_raw(c, KEY_SECRET)?.unwrap_or_default();
-            let cred = match get_raw(c, KEY_API_PASSWORD)? {
-                Some(h) => h,
-                None => get_raw(c, KEY_PASSWORD)?.unwrap_or_default(),
-            };
-            Ok((secret, cred))
-        })
-        .await?;
-    let key = blake3::derive_key("rillrss greader token v1", secret.as_bytes());
-    let h = blake3::keyed_hash(&key, cred.as_bytes());
-    Ok(h.to_hex()[..48].to_string())
+    let cred = stored_hash(app, Cred::Api).await?.unwrap_or_default();
+    greader_token_for(app, &cred).await
+}
+
+/// The token for a given credential hash (the one a login just matched).
+pub async fn greader_token_for(app: &App, cred: &str) -> Result<String> {
+    let secret = app.db.call(|c| get_raw(c, KEY_SECRET)).await?.unwrap_or_default();
+    Ok(derive_greader_token(&secret, cred))
 }
 
 /// Action token (`T`) for the Google Reader API: 57 characters like FreshRSS.
@@ -180,23 +205,38 @@ pub async fn revoke_sessions(app: &App, kinds: &[&str]) -> Result<()> {
         .await
 }
 
-/// Create a session token of the given kind.
-pub async fn create_session(app: &App, kind: &str, ttl: Option<Duration>, user_agent: Option<String>, ip: Option<IpAddr>) -> Result<String> {
+/// Create a session token of the given kind for a login that matched `cred_hash`.
+/// Returns None when that credential has changed since (password changed meanwhile).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_session(
+    app: &App,
+    kind: &str,
+    ttl: Option<Duration>,
+    user_agent: Option<String>,
+    ip: Option<IpAddr>,
+    cred: Cred,
+    cred_hash: String,
+) -> Result<Option<String>> {
     let token = util::random_token();
     let hash = util::token_hash(&token);
     let now = util::now();
     let expires = ttl.map(|t| now + t.as_secs() as i64);
     let kind = kind.to_string();
-    app.db
+    let sql = format!(
+        "INSERT INTO sessions (token_hash, kind, created_at, last_used_at, expires_at, user_agent, remote_addr)
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE {} = ?",
+        cred.sql()
+    );
+    let inserted = app
+        .db
         .call(move |c| {
-            c.execute(
-                "INSERT INTO sessions (token_hash, kind, created_at, last_used_at, expires_at, user_agent, remote_addr) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![hash, kind, now, now, expires, user_agent.map(|u| util::truncate_chars(&u, 200)), ip.map(|i| i.to_string())],
-            )?;
-            Ok(())
+            Ok(c.execute(
+                &sql,
+                params![hash, kind, now, now, expires, user_agent.map(|u| util::truncate_chars(&u, 200)), ip.map(|i| i.to_string()), cred_hash],
+            )?)
         })
         .await?;
-    Ok(token)
+    Ok((inserted == 1).then_some(token))
 }
 
 /// Validate a token of one of the given kinds.
@@ -243,20 +283,12 @@ pub async fn delete_session(app: &App, token: &str) -> Result<()> {
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
-/// Is this client currently locked out after too many failed logins?
-pub fn login_blocked(app: &App, ip: Option<IpAddr>) -> bool {
-    let Some(ip) = ip else { return false };
-    let map = app.login_failures.lock().unwrap();
-    matches!(map.get(&ip), Some((n, t)) if *n >= MAX_FAILURES && t.elapsed() < FAILURE_WINDOW)
-}
-
-pub fn record_login(app: &App, ip: Option<IpAddr>, success: bool) {
-    let Some(ip) = ip else { return };
+/// Start a login attempt; false while the client is locked out after too many
+/// failures. The attempt counts as a failure until `finish_login` reports success,
+/// so parallel guesses are limited too.
+pub fn begin_login(app: &App, ip: Option<IpAddr>) -> bool {
+    let Some(ip) = ip else { return true };
     let mut map = app.login_failures.lock().unwrap();
-    if success {
-        map.remove(&ip);
-        return;
-    }
     if map.len() > 10_000 {
         map.retain(|_, (_, t)| t.elapsed() < FAILURE_WINDOW);
     }
@@ -264,22 +296,43 @@ pub fn record_login(app: &App, ip: Option<IpAddr>, success: bool) {
     if e.1.elapsed() >= FAILURE_WINDOW {
         *e = (0, Instant::now());
     }
+    if e.0 >= MAX_FAILURES {
+        return false;
+    }
     e.0 += 1;
     e.1 = Instant::now();
+    true
 }
 
-/// Full API login check (username + password + throttling).
-pub async fn api_login(app: &App, user: &str, password: &str, ip: Option<IpAddr>) -> Result<bool> {
-    if login_blocked(app, ip) {
-        return Ok(false);
+/// End a login attempt started with `begin_login`; success clears the failures.
+pub fn finish_login(app: &App, ip: Option<IpAddr>, success: bool) {
+    if let (Some(ip), true) = (ip, success) {
+        app.login_failures.lock().unwrap().remove(&ip);
     }
-    let ok = username_matches(app, user) && verify_api_password(app, password).await?;
-    record_login(app, ip, ok);
-    if !ok {
+}
+
+/// Full API login check (username + password + throttling). `passwords` are
+/// alternative spellings of one attempt (e.g. base64 from old TT-RSS clients).
+/// Returns the matched credential hash.
+pub async fn api_login(app: &App, user: &str, passwords: &[&str], ip: Option<IpAddr>) -> Result<Option<String>> {
+    if !begin_login(app, ip) {
+        return Ok(None);
+    }
+    let mut matched = None;
+    if username_matches(app, user) {
+        for p in passwords {
+            matched = check_password(app, Cred::Api, p).await?;
+            if matched.is_some() {
+                break;
+            }
+        }
+    }
+    finish_login(app, ip, matched.is_some());
+    if matched.is_none() {
         app.event(crate::app::Level::Warn, "api", Default::default(), format!("API 登录失败：用户 '{}'，来自 {:?}", util::truncate_chars(user, 64), ip))
             .await;
     }
-    Ok(ok)
+    Ok(matched)
 }
 
 #[cfg(test)]

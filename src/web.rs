@@ -266,18 +266,24 @@ async fn login_post(State(app): State<AppRef>, headers: HeaderMap, ConnectInfo(p
     let pass = form.get("password").unwrap_or("");
     let ip = client_ip(&app, &headers, Some(peer));
     let fail = |msg: &str| render(LoginT { css: CSS, username: user.clone(), error: Some(msg.to_string()) });
-    if auth::login_blocked(&app, ip) {
+    if !auth::begin_login(&app, ip) {
         return fail("尝试次数过多，请 15 分钟后再试。");
     }
-    let ok = auth::username_matches(&app, &user) && auth::verify_password(&app, pass).await.unwrap_or(false);
-    auth::record_login(&app, ip, ok);
-    if !ok {
+    let cred = if auth::username_matches(&app, &user) {
+        auth::check_password(&app, auth::Cred::Admin, pass).await.unwrap_or(None)
+    } else {
+        None
+    };
+    auth::finish_login(&app, ip, cred.is_some());
+    let Some(cred) = cred else {
         app.event(Level::Warn, "system", EventRef::default(), format!("后台登录失败，来自 {ip:?}")).await;
         return fail("用户名或密码错误。");
-    }
+    };
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    let token = match auth::create_session(&app, "web", Some(std::time::Duration::from_secs(SESSION_DAYS * 86400)), ua, ip).await {
-        Ok(t) => t,
+    let ttl = Some(std::time::Duration::from_secs(SESSION_DAYS * 86400));
+    let token = match auth::create_session(&app, "web", ttl, ua, ip, auth::Cred::Admin, cred).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return fail("密码刚刚被修改，请用新密码登录。"),
         Err(e) => return server_error(e),
     };
     let secure = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https")

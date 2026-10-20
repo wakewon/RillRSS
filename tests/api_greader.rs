@@ -254,3 +254,27 @@ async fn cached_image_urls_use_request_host() {
     assert_eq!(img.status(), 200);
     assert_eq!(img.headers()["content-type"], "image/png");
 }
+
+/// Behind a proxy that appends the real client address, forged X-Forwarded-For
+/// entries must not dodge the login limit, and parallel guesses count as well.
+#[tokio::test]
+async fn login_throttle_cannot_be_dodged() {
+    let t = start_app(|_| {}).await;
+    let login = |xff: String, pass: &'static str| {
+        let req = t
+            .client
+            .post(t.url("/accounts/ClientLogin"))
+            .header("X-Forwarded-For", xff)
+            .form(&[("Email", "admin"), ("Passwd", pass)]);
+        async move { req.send().await.unwrap().status().as_u16() }
+    };
+    // 20 parallel wrong guesses from client 8.8.4.4, each with a different forged entry.
+    let guesses: Vec<_> = (0..20).map(|i| login(format!("9.9.9.{i}, 8.8.4.4"), "wrong")).collect();
+    assert!(futures::future::join_all(guesses).await.iter().all(|s| *s == 401));
+    // Only the first 10 were checked; the rest were refused before hashing.
+    assert_eq!(t.count("SELECT COUNT(*) FROM events WHERE message LIKE 'API 登录失败%'").await, 10);
+    // That client is now locked out, even with the right password...
+    assert_eq!(login("1.2.3.4, 8.8.4.4".into(), "password123").await, 401);
+    // ...while another client still gets in.
+    assert_eq!(login("8.8.8.8".into(), "password123").await, 200);
+}

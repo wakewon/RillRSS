@@ -27,21 +27,35 @@ pub async fn request_base(app: &App, headers: &HeaderMap) -> String {
     format!("{proto}://{host}{}", prefix.trim_end_matches('/'))
 }
 
-/// Client IP (honouring X-Forwarded-For / X-Real-IP when trusting a proxy).
+/// Client IP for login throttling and logs. Forwarding headers count only when
+/// trusting a proxy and the connection comes from a private address (the proxy).
+/// X-Forwarded-For is read from the right: a proxy appends the address it saw, and
+/// anything to its left was sent by the client and can be forged. The rightmost
+/// public entry is the client; with only private entries (LAN) the leftmost is.
 pub fn client_ip(app: &App, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
-    if app.cfg.trust_proxy {
-        for name in ["x-forwarded-for", "x-real-ip"] {
-            if let Some(ip) = headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .and_then(|s| s.trim().parse::<IpAddr>().ok())
-            {
-                return Some(ip);
-            }
-        }
+    forwarded_client_ip(app.cfg.trust_proxy, headers, peer)
+}
+
+fn forwarded_client_ip(trust_proxy: bool, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
+    let peer_ip = peer.map(|p| p.ip());
+    if !trust_proxy || peer_ip.is_some_and(crate::http::is_public_ip) {
+        return peer_ip;
     }
-    peer.map(|p| p.ip())
+    let forwarded: Vec<IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .collect();
+    if let Some(ip) = forwarded.iter().rev().find(|ip| crate::http::is_public_ip(**ip)).or(forwarded.first()) {
+        return Some(*ip);
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        .or(peer_ip)
 }
 
 /// Multimap of request parameters (query string + form body), preserving order.
@@ -71,8 +85,12 @@ impl Params {
     }
 }
 
+/// Most parameters accepted from one source. Clients batch item ids well below this
+/// (FreshRSS's PHP default allows 1000 inputs); it bounds the memory a request costs.
+const MAX_PARAMS: usize = 20_000;
+
 fn form_urlencoded_pairs(input: &[u8]) -> Vec<(String, String)> {
-    url::form_urlencoded::parse(input).map(|(k, v)| (k.into_owned(), v.into_owned())).collect()
+    url::form_urlencoded::parse(input).take(MAX_PARAMS).map(|(k, v)| (k.into_owned(), v.into_owned())).collect()
 }
 
 /// Headers sent on every API response.
@@ -96,4 +114,37 @@ pub fn cap_content(s: String, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(headers: &[(&'static str, &str)], peer: &str) -> Option<IpAddr> {
+        let mut h = HeaderMap::new();
+        for (k, v) in headers {
+            h.append(*k, HeaderValue::from_str(v).unwrap());
+        }
+        forwarded_client_ip(true, &h, Some(format!("{peer}:1234").parse().unwrap()))
+    }
+
+    #[test]
+    fn client_ip_reads_forwarded_for_from_the_right() {
+        let some = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        // nginx appends the real address; forged entries on the left are ignored.
+        assert_eq!(ip(&[("x-forwarded-for", "9.9.9.9, 8.8.4.4")], "172.18.0.1"), some("8.8.4.4"));
+        // Further private hops (another proxy on the LAN) are skipped.
+        assert_eq!(ip(&[("x-forwarded-for", "1.1.1.1, 8.8.4.4, 10.0.0.2")], "127.0.0.1"), some("8.8.4.4"));
+        // Only private entries: a LAN client, the leftmost is it.
+        assert_eq!(ip(&[("x-forwarded-for", "192.168.1.20, 10.0.0.2")], "127.0.0.1"), some("192.168.1.20"));
+        // Repeated headers count as one list.
+        assert_eq!(ip(&[("x-forwarded-for", "9.9.9.9"), ("x-forwarded-for", "8.8.4.4")], "127.0.0.1"), some("8.8.4.4"));
+        assert_eq!(ip(&[("x-real-ip", "8.8.4.4")], "127.0.0.1"), some("8.8.4.4"));
+        assert_eq!(ip(&[("x-forwarded-for", "junk")], "127.0.0.1"), some("127.0.0.1"));
+        // A public peer is not a proxy we run: its headers are not trusted.
+        assert_eq!(ip(&[("x-forwarded-for", "8.8.4.4")], "1.1.1.1"), some("1.1.1.1"));
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_static("8.8.4.4"));
+        assert_eq!(forwarded_client_ip(false, &h, Some("127.0.0.1:1".parse().unwrap())), some("127.0.0.1"));
+    }
 }
