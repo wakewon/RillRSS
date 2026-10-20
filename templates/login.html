@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>登录 · RillRSS</title>
+<link rel="stylesheet" href="/admin/static/admin.css">
+</head>
+<body>
+<div class="login card">
+  <h1>RillRSS</h1>
+  {% if let Some(err) = error %}<div class="flash err">{{ err }}</div>{% endif %}
+  <form method="post" action="/admin/login">
+    <label for="u">用户名</label>
+    <input type="text" id="u" name="username" value="{{ username }}" autocomplete="username" required>
+    <label for="p">密码</label>
+    <input type="password" id="p" name="password" autocomplete="current-password" required autofocus>
+    <div class="actions"><button>登录</button></div>
+  </form>
+</div>
+</body>
+</html>

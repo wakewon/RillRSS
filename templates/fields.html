@@ -1,0 +1,19 @@
+{# Generic form field rendering: expects `f` of type Field #}
+{% if f.kind == "bool" %}
+<input type="hidden" name="_bool" value="{{ f.name }}">
+<label class="check"><input type="checkbox" name="{{ f.name }}" value="on" {% if f.checked %}checked{% endif %}> {{ f.label }}</label>
+{% else %}
+<label for="f_{{ f.name }}">{{ f.label }}</label>
+{% if f.kind == "select" %}
+<select id="f_{{ f.name }}" name="{{ f.name }}">
+{% for o in f.options %}<option value="{{ o.0 }}" {% if o.0 == f.value %}selected{% endif %}>{{ o.1 }}</option>{% endfor %}
+</select>
+{% else if f.kind == "textarea" %}
+<textarea id="f_{{ f.name }}" name="{{ f.name }}">{{ f.value }}</textarea>
+{% else if f.kind == "password" %}
+<input type="password" id="f_{{ f.name }}" name="{{ f.name }}" value="" placeholder="{% if f.value.is_empty() %}未设置{% else %}已设置（留空则不修改）{% endif %}" autocomplete="new-password">
+{% else %}
+<input type="{{ f.kind }}" id="f_{{ f.name }}" name="{{ f.name }}" value="{{ f.value }}" {% if f.kind == "number" %}step="any"{% endif %}>
+{% endif %}
+{% endif %}
+{% if !f.help.is_empty() %}<div class="help">{{ f.help }}</div>{% endif %}

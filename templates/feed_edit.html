@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ feed.title }}{% endblock %}
+{% block content %}
+<h1>{{ feed.title }}</h1>
+<p class="muted small">ID {{ feed.id }} · <a href="{{ feed.url }}" rel="noreferrer">{{ feed.url }}</a>{% if !feed.site_url.is_empty() %} · <a href="{{ feed.site_url }}" rel="noreferrer">网站</a>{% endif %}</p>
+<div class="grid">
+  <div class="stat"><b>{{ feed.unread }}</b><span>未读 / 共 {{ feed.items }}</span></div>
+  <div class="stat"><b>{{ feed.stories }}</b><span>新闻条目（已发布版本 {{ feed.versions }}）</span></div>
+  <div class="stat"><b>{{ feed.last_fetch }}</b><span>上次抓取（HTTP {{ feed.last_status }}，{{ feed.duration }} ms）</span></div>
+  <div class="stat"><b>{{ feed.next_fetch }}</b><span>下次抓取</span></div>
+</div>
+{% if !feed.error.is_empty() %}<div class="flash err">连续失败 {{ feed.error_count }} 次：{{ feed.error }}</div>{% endif %}
+<div class="actions">
+  <form method="post" action="/admin/feeds/{{ feed.id }}/refresh" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">立即刷新</button></form>
+  <form method="post" action="/admin/feeds/{{ feed.id }}/reprocess" class="inline" data-confirm="按当前设置重新处理最近的文章？更新后的文章会以新版本发布。"><input type="hidden" name="csrf" value="{{ base.csrf }}"><input type="hidden" name="limit" value="10"><button class="secondary">重新处理最近 10 篇</button></form>
+  <form method="post" action="/admin/feeds/{{ feed.id }}/markread" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">全部标为已读</button></form>
+  <form method="post" action="/admin/tasks/retry" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><input type="hidden" name="feed" value="{{ feed.id }}"><button class="secondary">重试失败任务</button></form>
+  <a class="btn secondary" href="/admin/items?feed={{ feed.id }}">查看文章</a>
+  <form method="post" action="/admin/feeds/{{ feed.id }}/delete" class="inline" data-confirm="确定删除该订阅及其所有文章？"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="danger">删除订阅</button></form>
+</div>
+<form method="post" action="/admin/feeds/{{ feed.id }}" class="card">
+  <input type="hidden" name="csrf" value="{{ base.csrf }}">
+  {% for sec in sections %}
+  <h3>{{ sec.title }}</h3>
+  {% if !sec.help.is_empty() %}<div class="help">{{ sec.help }}</div>{% endif %}
+  <div class="fields">{% for f in sec.fields %}<div>{% include "fields.html" %}</div>{% endfor %}</div>
+  {% endfor %}
+  <div class="actions"><button>保存</button></div>
+</form>
+<h2>最近事件</h2>
+{% include "events_table.html" %}
+{% endblock %}

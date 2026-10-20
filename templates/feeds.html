@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}订阅{% endblock %}
+{% block content %}
+<h1>订阅</h1>
+<div class="card">
+  <form method="post" action="/admin/feeds">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <div class="row">
+      <div><label>订阅地址（RSS/Atom/JSON Feed 或网页地址）</label><input type="url" name="url" required placeholder="https://example.com/feed.xml"></div>
+      <div class="shrink" style="min-width:150px"><label>分类</label>
+        <select name="category"><option value="">（未分类）</option>{% for c in categories %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div>
+      <div class="shrink" style="min-width:180px"><label>预设</label>
+        <select name="preset">
+          <option value="plain">仅订阅</option>
+          <option value="fulltext">全文提取</option>
+          <option value="fulltext_tr">全文 + 翻译</option>
+          <option value="tr">翻译</option>
+          <option value="t2s">繁转简 + 图片缓存</option>
+        </select></div>
+      <div class="shrink"><button>添加</button></div>
+    </div>
+    <div class="help">添加后可在订阅详情页调整全文提取、繁简转换、翻译、图片缓存与更新追踪等选项。</div>
+  </form>
+</div>
+<div class="actions">
+  <form method="post" action="/admin/feeds/refresh-all" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">全部刷新</button></form>
+  <a class="btn secondary" href="/admin/categories">管理分类</a>
+  <a class="btn secondary" href="/admin/opml">OPML 导入/导出</a>
+</div>
+<div class="table-wrap"><table>
+<tr><th>名称</th><th>分类</th><th>处理</th><th class="num">未读</th><th class="num">文章</th><th>上次更新</th><th>状态</th></tr>
+{% for f in feeds %}
+<tr>
+  <td class="ellipsis"><a href="/admin/feeds/{{ f.id }}">{{ f.title }}</a>{% if !f.enabled %} <span class="badge">已停用</span>{% endif %}<div class="small muted ellipsis">{{ f.url }}</div></td>
+  <td>{{ f.category }}</td>
+  <td>{% for b in f.badges %}<span class="badge on">{{ b }}</span>{% endfor %}</td>
+  <td class="num">{{ f.unread }}</td>
+  <td class="num">{{ f.items }}</td>
+  <td class="small">{{ f.last_fetch }}</td>
+  <td class="small">{% if f.error.is_empty() %}<span class="ok">正常</span>{% else %}<span class="err" title="{{ f.error }}">错误 ×{{ f.error_count }}</span>{% endif %}</td>
+</tr>
+{% endfor %}
+</table></div>
+{% if feeds.is_empty() %}<p class="muted">还没有订阅。添加一个，或导入 OPML。</p>{% endif %}
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}日志{% endblock %}
+{% block content %}
+<h1>日志</h1>
+<form method="get" action="/admin/events" class="card row">
+  <div><label>级别</label><select name="level">
+    <option value="" {% if level == "" %}selected{% endif %}>全部</option>
+    <option value="warn" {% if level == "warn" %}selected{% endif %}>警告及以上</option>
+    <option value="error" {% if level == "error" %}selected{% endif %}>仅错误</option></select></div>
+  <div><label>类型</label><input type="text" name="kind" value="{{ kind }}" placeholder="fetch / translate / update …"></div>
+  <div class="shrink"><button>筛选</button></div>
+</form>
+{% include "events_table.html" %}
+{% endblock %}

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}账户{% endblock %}
+{% block content %}
+<h1>账户</h1>
+<div class="card">
+  <h3 style="margin-top:0">管理密码</h3>
+  <form method="post" action="/admin/account/password">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <div class="fields">
+      <div><label>当前密码</label><input type="password" name="current" required autocomplete="current-password"></div>
+      <div><label>新密码（至少 8 位）</label><input type="password" name="new" required minlength="8" autocomplete="new-password"></div>
+    </div>
+    <div class="help">修改后所有网页会话失效；若未设置 API 专用密码，阅读器也需要重新登录。</div>
+    <div class="actions"><button>修改</button></div>
+  </form>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">API 专用密码</h3>
+  <p class="small">当前：{% if api_password %}<b>已设置</b>，阅读器需使用该密码登录{% else %}未设置，阅读器使用管理密码登录{% endif %}。建议为手机阅读器设置单独的密码。</p>
+  <form method="post" action="/admin/account/api-password">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <div class="fields"><div><label>新的 API 密码（留空表示取消，改回使用管理密码）</label><input type="password" name="password" minlength="8" autocomplete="new-password"></div></div>
+    <div class="help">保存后所有阅读器的登录令牌都会失效，需要重新登录。</div>
+    <div class="actions"><button>保存</button></div>
+  </form>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">已登录的客户端</h3>
+  <div class="table-wrap"><table>
+  <tr><th>类型</th><th>客户端</th><th>地址</th><th>最近使用</th></tr>
+  {% for s in sessions %}<tr><td>{{ s.0 }}</td><td class="small ellipsis">{{ s.1 }}</td><td class="small">{{ s.2 }}</td><td class="small">{{ s.3 }}</td></tr>{% endfor %}
+  </table></div>
+  <div class="help">Google Reader API 令牌由密码派生，长期有效，修改密码即失效；此处列出 TT-RSS 与网页会话。</div>
+  <form method="post" action="/admin/account/revoke" data-confirm="注销所有阅读器会话？"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">注销所有 TT-RSS 会话</button></form>
+</div>
+{% endblock %}

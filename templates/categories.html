@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}分类{% endblock %}
+{% block content %}
+<h1>分类</h1>
+<div class="card">
+<form method="post" action="/admin/categories" class="row">
+  <input type="hidden" name="csrf" value="{{ base.csrf }}">
+  <div><label>新分类</label><input type="text" name="name" required></div>
+  <div class="shrink"><button>创建</button></div>
+</form>
+</div>
+<div class="table-wrap"><table>
+<tr><th>名称</th><th class="num">订阅数</th><th>重命名</th><th></th></tr>
+{% for c in cats %}
+<tr>
+  <td>{{ c.name }}</td><td class="num">{{ c.feeds }}</td>
+  <td><form method="post" action="/admin/categories/{{ c.id }}/rename" class="row"><input type="hidden" name="csrf" value="{{ base.csrf }}"><div><input type="text" name="name" value="{{ c.name }}"></div><div class="shrink"><button class="secondary">保存</button></div></form></td>
+  <td><form method="post" action="/admin/categories/{{ c.id }}/delete" data-confirm="删除分类？其中的订阅会变为未分类。"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="danger">删除</button></form></td>
+</tr>
+{% endfor %}
+</table></div>
+{% endblock %}

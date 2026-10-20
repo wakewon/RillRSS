@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}任务{% endblock %}
+{% block content %}
+<h1>任务</h1>
+<div class="actions">
+  <form method="post" action="/admin/tasks/retry" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button>重试所有失败任务</button></form>
+  <form method="post" action="/admin/maintenance/cleanup" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">立即执行清理</button></form>
+</div>
+<h2>处理中 / 等待重试</h2>
+<div class="table-wrap"><table>
+<tr><th>#</th><th>订阅</th><th>标题</th><th>原因</th><th>阶段</th><th class="num">尝试</th><th>下次尝试</th><th>最近错误</th></tr>
+{% for r in pending %}<tr><td class="small">{{ r.id }}</td><td class="small"><a href="/admin/feeds/{{ r.feed_id }}">{{ r.feed }}</a></td><td class="ellipsis">{{ r.title }}</td><td>{{ r.reason }}</td><td>{{ r.stage }}</td><td class="num">{{ r.attempts }}</td><td class="small">{{ r.next }}</td><td class="small err">{{ r.error }}</td></tr>{% endfor %}
+</table></div>
+{% if pending.is_empty() %}<p class="muted">队列为空。</p>{% endif %}
+<h2>失败</h2>
+<div class="table-wrap"><table>
+<tr><th>#</th><th>订阅</th><th>标题</th><th>原因</th><th>阶段</th><th>错误</th><th>时间</th></tr>
+{% for r in failed %}<tr><td class="small">{{ r.id }}</td><td class="small"><a href="/admin/feeds/{{ r.feed_id }}">{{ r.feed }}</a></td><td class="ellipsis">{{ r.title }}</td><td>{{ r.reason }}</td><td>{{ r.stage }}</td><td class="small err">{{ r.error }}</td><td class="small">{{ r.next }}</td></tr>{% endfor %}
+</table></div>
+<h2>订阅抓取错误</h2>
+<div class="table-wrap"><table>
+<tr><th>订阅</th><th class="num">连续失败</th><th>错误</th><th>下次抓取</th></tr>
+{% for f in feed_errors %}<tr><td><a href="/admin/feeds/{{ f.0 }}">{{ f.1 }}</a></td><td class="num">{{ f.2 }}</td><td class="small err">{{ f.3 }}</td><td class="small">{{ f.4 }}</td></tr>{% endfor %}
+</table></div>
+{% endblock %}

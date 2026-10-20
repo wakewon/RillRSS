@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}概览{% endblock %}
+{% block content %}
+<h1>概览</h1>
+<div class="grid">
+  <div class="stat"><b>{{ s.feeds }}</b><span>订阅源（{{ s.feeds_error }} 个出错）</span></div>
+  <div class="stat"><b>{{ s.unread }}</b><span>未读文章 / 共 {{ s.items }}</span></div>
+  <div class="stat"><b>{{ s.starred }}</b><span>收藏</span></div>
+  <div class="stat"><b>{{ s.pending }}</b><span>处理中（失败 {{ s.failed }}）</span></div>
+  <div class="stat"><b>{{ s.updates }}</b><span>24 小时内发布的新版本</span></div>
+  <div class="stat"><b>{{ s.images }}</b><span>缓存图片（{{ s.images_size }}）</span></div>
+  <div class="stat"><b>{{ s.db_size }}</b><span>数据库大小</span></div>
+  <div class="stat"><b>{{ s.uptime }}</b><span>运行时间</span></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">阅读器连接</h3>
+  <table>
+    <tr><th>Google Reader / FreshRSS API</th><td><code>{{ s.base }}/api/greader.php</code><div class="help">Reeder、NetNewsWire、FeedMe、FocusReader、Read You、Fluent Reader 等选择 FreshRSS / Google Reader 类型。也兼容 <code>/plugins.local/freshapi/api/greader.php</code> 与根路径 <code>{{ s.base }}</code>。</div></td></tr>
+    <tr><th>TT-RSS API</th><td><code>{{ s.base }}</code>（客户端会自动追加 <code>/api/</code>）<div class="help">TTRSS-Reader、News+、Fiery Feeds、tt-rss Android 等。也可使用 <code>{{ s.base }}/tt-rss</code>。</div></td></tr>
+    <tr><th>用户名 / 密码</th><td><code>{{ s.username }}</code> / {% if s.api_password %}API 专用密码{% else %}与管理密码相同{% endif %}（<a href="/admin/account">修改</a>）</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">翻译服务</h3>
+  {% if s.tr_configured %}
+  <p>模型 <code>{{ s.tr_model }}</code> ·
+    {% if let Some(c) = s.tr_circuit %}<span class="err">已暂停（{{ c }} 后重试）</span>{% else %}<span class="ok">正常</span>{% endif %}
+    · 请求 {{ s.tr_requests }} 次，失败 {{ s.tr_failures }} 次，缓存命中 {{ s.tr_cache_hits }} 段，Token {{ s.tr_tokens }}，进行中 {{ s.tr_in_flight }}</p>
+  {% if let Some(e) = s.tr_last_error %}<p class="small err">最近错误：{{ e }}</p>{% endif %}
+  {% else %}
+  <p class="muted">未配置。请在 <a href="/admin/settings#translation">设置</a> 中填写 OpenAI 兼容接口。</p>
+  {% endif %}
+</div>
+
+<h2>处理队列</h2>
+<div class="table-wrap"><table>
+<tr><th>阶段</th><th class="num">待处理</th><th class="num">等待重试</th></tr>
+{% for r in stages %}<tr><td>{{ r.0 }}</td><td class="num">{{ r.1 }}</td><td class="num">{{ r.2 }}</td></tr>{% endfor %}
+</table></div>
+
+<h2>最近事件 <a class="small" href="/admin/events">全部</a></h2>
+{% include "events_table.html" %}
+{% endblock %}

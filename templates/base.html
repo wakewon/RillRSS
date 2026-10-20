@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{% block title %}RillRSS{% endblock %} · RillRSS</title>
+<link rel="stylesheet" href="/admin/static/admin.css?v={{ base.version }}">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/admin">RillRSS</a>
+  <nav>
+    <a href="/admin" class="{% if base.nav == "dash" %}on{% endif %}">概览</a>
+    <a href="/admin/feeds" class="{% if base.nav == "feeds" %}on{% endif %}">订阅</a>
+    <a href="/admin/items" class="{% if base.nav == "items" %}on{% endif %}">文章</a>
+    <a href="/admin/tasks" class="{% if base.nav == "tasks" %}on{% endif %}">任务</a>
+    <a href="/admin/events" class="{% if base.nav == "events" %}on{% endif %}">日志</a>
+    <a href="/admin/settings" class="{% if base.nav == "settings" %}on{% endif %}">设置</a>
+    <a href="/admin/tools" class="{% if base.nav == "tools" %}on{% endif %}">工具</a>
+    <a href="/admin/account" class="{% if base.nav == "account" %}on{% endif %}">账户</a>
+  </nav>
+  <form method="post" action="/admin/logout" class="logout"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="link">退出</button></form>
+</header>
+<main>
+{% if let Some(msg) = base.flash %}<div class="flash">{{ msg }}</div>{% endif %}
+{% if let Some(err) = base.error %}<div class="flash err">{{ err }}</div>{% endif %}
+{% block content %}{% endblock %}
+</main>
+<footer>RillRSS {{ base.version }}</footer>
+<script>
+document.addEventListener('submit', function (e) {
+  var f = e.target; var q = f.getAttribute('data-confirm');
+  if (q && !window.confirm(q)) { e.preventDefault(); }
+});
+</script>
+</body>
+</html>

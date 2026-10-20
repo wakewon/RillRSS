@@ -1,0 +1,12 @@
+<div class="table-wrap"><table>
+<tr><th>时间</th><th>级别</th><th>类型</th><th>订阅</th><th>内容</th></tr>
+{% for e in events %}
+<tr>
+  <td class="small" style="white-space:nowrap">{{ e.time }}</td>
+  <td class="{{ e.level_class }}">{{ e.level }}</td>
+  <td>{{ e.kind }}</td>
+  <td class="small">{% if let Some(fid) = e.feed_id %}<a href="/admin/feeds/{{ fid }}">{{ e.feed_title }}</a>{% endif %}</td>
+  <td class="small">{{ e.message }}{% if let Some(iid) = e.item_id %} <a href="/admin/items/{{ iid }}">#{{ iid }}</a>{% endif %}</td>
+</tr>
+{% endfor %}
+</table></div>

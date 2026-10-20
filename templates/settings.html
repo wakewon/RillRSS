@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}设置{% endblock %}
+{% block content %}
+<h1>设置</h1>
+<form method="post" action="/admin/settings">
+  <input type="hidden" name="csrf" value="{{ base.csrf }}">
+  {% for sec in sections %}
+  <div class="card" id="{{ sec.id }}">
+    <h3 style="margin-top:0">{{ sec.title }}</h3>
+    {% if !sec.help.is_empty() %}<div class="help">{{ sec.help }}</div>{% endif %}
+    <div class="fields">{% for f in sec.fields %}<div>{% include "fields.html" %}</div>{% endfor %}</div>
+  </div>
+  {% endfor %}
+  <div class="actions"><button>保存设置</button></div>
+</form>
+<div class="card">
+  <h3 style="margin-top:0">测试翻译服务</h3>
+  <form method="post" action="/admin/tools/translate">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <input type="hidden" name="text" value="The prime minister said on Monday that taxes would rise next year, and opposition parties criticised the plan.">
+    <input type="hidden" name="target" value="zh-CN">
+    <button class="secondary">发送测试请求</button>
+  </form>
+</div>
+{% endblock %}

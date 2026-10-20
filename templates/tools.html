@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}工具{% endblock %}
+{% block content %}
+<h1>诊断工具</h1>
+<div class="card">
+  <h3 style="margin-top:0">测试全文提取</h3>
+  <form method="post" action="/admin/tools/extract">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <div class="row">
+      <div><label>文章地址</label><input type="url" name="url" value="{{ extract_url }}" required></div>
+      <div class="shrink" style="min-width:160px"><label>方式</label><select name="mode">
+        <option value="readability">内置 Readability</option><option value="selector">CSS 选择器</option><option value="external">外部提取服务</option></select></div>
+      <div><label>CSS 选择器（可选）</label><input type="text" name="selector"></div>
+      <div class="shrink"><button>提取</button></div>
+    </div>
+  </form>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">测试翻译</h3>
+  <form method="post" action="/admin/tools/translate">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <label>文本或 HTML</label><textarea name="text">{{ translate_text }}</textarea>
+    <div class="row"><div><label>目标语言</label><input type="text" name="target" value="zh-CN"></div><div class="shrink"><button>翻译</button></div></div>
+  </form>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">测试订阅地址</h3>
+  <form method="post" action="/admin/tools/feed" class="row">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <div><label>订阅或网页地址</label><input type="url" name="url" required></div>
+    <div class="shrink"><button>检测</button></div>
+  </form>
+</div>
+{% if !result_title.is_empty() %}
+<h2>{{ result_title }}</h2>
+{% if !result_meta.is_empty() %}<pre>{{ result_meta }}</pre>{% endif %}
+{% if !result_html.is_empty() %}<div class="preview">{{ result_html|safe }}</div>{% endif %}
+{% endif %}
+{% endblock %}

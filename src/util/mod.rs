@@ -73,21 +73,24 @@ pub fn fmt_ts(ts: Option<i64>) -> String {
     }
 }
 
-/// Relative description of a timestamp ("5 min ago", "in 3 h").
+/// Relative description of a timestamp in Chinese ("5 分钟前", "3 小时后").
 pub fn fmt_relative(ts: Option<i64>) -> String {
     let Some(t) = ts.filter(|t| *t > 0) else {
         return "-".into();
     };
     let d = t - now();
     let (abs, future) = if d >= 0 { (d, true) } else { (-d, false) };
+    if abs < 30 {
+        return "刚刚".into();
+    }
     let s = if abs < 60 {
-        format!("{abs} s")
+        format!("{abs} 秒")
     } else if abs < 3600 {
-        format!("{} min", abs / 60)
+        format!("{} 分钟", abs / 60)
     } else if abs < 86400 {
-        format!("{} h", abs / 3600)
+        format!("{} 小时", abs / 3600)
     } else {
-        format!("{} d", abs / 86400)
+        format!("{} 天", abs / 86400)
     };
-    if future { format!("in {s}") } else { format!("{s} ago") }
+    if future { format!("{s}后") } else { format!("{s}前") }
 }

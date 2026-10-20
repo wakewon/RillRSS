@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}OPML{% endblock %}
+{% block content %}
+<h1>OPML 导入 / 导出</h1>
+<div class="card">
+  <h3 style="margin-top:0">导入</h3>
+  <form method="post" action="/admin/opml/import?csrf={{ base.csrf }}" enctype="multipart/form-data">
+    <label>OPML 文件</label><input type="file" name="file" accept=".opml,.xml,text/xml,application/xml">
+    <label>或粘贴 OPML 内容</label><textarea name="text"></textarea>
+    <div class="help">已存在的订阅会被跳过；嵌套的 outline 会作为分类导入。RillRSS 导出的 OPML 会同时恢复每个订阅的处理选项。</div>
+    <div class="actions"><button>导入</button></div>
+  </form>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">导出</h3>
+  <a class="btn" href="/admin/opml/export">下载 OPML</a>
+</div>
+{% endblock %}
