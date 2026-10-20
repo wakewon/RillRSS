@@ -15,6 +15,7 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 use crate::api::{client_ip, request_base};
+use crate::pipeline::Queued;
 use crate::app::{AppRef, EventRef, Level};
 use crate::auth;
 use crate::content::{convert, extract, sanitize};
@@ -1515,8 +1516,9 @@ async fn story_reprocess(State(app): State<AppRef>, headers: HeaderMap, Path(id)
         Err(e) => return server_error(e),
     }
     match crate::pipeline::reprocess_story(&app, id).await {
-        Ok(true) => redirect_msg(&back, "已安排重新处理，完成后以新版本发布（保留已读与收藏状态）。"),
-        Ok(false) => redirect_err(&back, "没有可重新处理的源数据。"),
+        Ok(Queued::Inserted) => redirect_msg(&back, "已安排重新处理，完成后以新版本发布（保留已读与收藏状态）。"),
+        Ok(Queued::Pending) => redirect_msg(&back, "这条新闻已有尚未完成的处理（例如新闻更新），已提前执行，会按当前设置完成。"),
+        Ok(Queued::Missing) => redirect_err(&back, "没有可重新处理的源数据。"),
         Err(e) => server_error(e),
     }
 }
@@ -1769,7 +1771,7 @@ fn settings_sections(s: &Settings) -> Vec<Section> {
             fields: vec![
                 n("updates.min_interval_min", "两次版本最小间隔（分钟）", &s.updates.min_interval_min, "期间的多次修改合并为一次发布"),
                 n("updates.max_versions", "每条新闻最多版本数", &s.updates.max_versions, "含首个版本；0 表示不限制"),
-                n("updates.track_hours", "追踪时长（小时）", &s.updates.track_hours, "仅追踪首次出现后若干小时内的更新"),
+                n("updates.track_hours", "追踪时长（小时）", &s.updates.track_hours, "仅追踪首次出现后若干小时内的更新；0 表示不限制"),
                 field("updates.page_check_minutes", "原文复查时间点（分钟）", "text", s.updates.page_check_minutes.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "), "「页面追踪」模式下，首次出现后的复查时间"),
                 n("updates.min_change_ratio", "最小变化比例", &s.updates.min_change_ratio, "0–1，文本相似度下降超过该值才算修改"),
                 n("updates.min_changed_tokens", "最少变化词数", &s.updates.min_changed_tokens, ""),
@@ -1792,7 +1794,7 @@ fn settings_sections(s: &Settings) -> Vec<Section> {
                 n("retention.days", "文章保留天数", &s.retention.days, "按收到时间计算；收藏不会被删除；0 表示永久保留"),
                 check("retention.keep_unread", "保留未读文章", s.retention.keep_unread, ""),
                 n("retention.max_items_per_feed", "每个订阅最多文章数", &s.retention.max_items_per_feed, "0 表示不限制"),
-                n("retention.superseded_days", "旧版本保留天数", &s.retention.superseded_days, "新闻更新后被取代的旧版本（已标为已读）；超过文章保留天数时以后者为准"),
+                n("retention.superseded_days", "旧版本保留天数", &s.retention.superseded_days, "新闻更新后被取代的旧版本（已标为已读）；超过文章保留天数时以后者为准；0 表示不单独清理"),
                 n("retention.translation_cache_days", "翻译缓存保留天数", &s.retention.translation_cache_days, "超过该天数未再使用的译文会被删除"),
                 n("retention.event_rows", "日志保留条数", &s.retention.event_rows, ""),
             ],

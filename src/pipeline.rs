@@ -1205,7 +1205,7 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
 
 /// Result of queueing a reprocess for one story.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Queued {
+pub enum Queued {
     Inserted,
     /// A revision is already pending: it runs with the current settings anyway.
     Pending,
@@ -1244,8 +1244,7 @@ fn insert_reprocess(tx: &Transaction, story_id: i64, stage: &str, priority: i64,
 }
 
 /// Re-run processing for a story from its latest source (publishes a new version).
-/// Returns false when there is nothing to reprocess from.
-pub async fn reprocess_story(app: &AppRef, story_id: i64) -> Result<bool> {
+pub async fn reprocess_story(app: &AppRef, story_id: i64) -> Result<Queued> {
     let now = util::now();
     let feed_id: i64 = app.db.call(move |c| Ok(c.query_row("SELECT feed_id FROM stories WHERE id = ?", [story_id], |r| r.get(0))?)).await?;
     let feed = app.db.call(move |c| load_feed(c, feed_id)).await?.ok_or_else(|| anyhow!("feed gone"))?;
@@ -1254,7 +1253,7 @@ pub async fn reprocess_story(app: &AppRef, story_id: i64) -> Result<bool> {
     if queued != Queued::Missing {
         app.wake_pipeline.notify_one();
     }
-    Ok(queued != Queued::Missing)
+    Ok(queued)
 }
 
 /// Which published articles a bulk reprocess covers.

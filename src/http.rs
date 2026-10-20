@@ -460,6 +460,8 @@ pub struct HostLimiter {
 
 struct HostSlot {
     sem: Arc<Semaphore>,
+    /// Permits `sem` was created with.
+    limit: usize,
     next_allowed: Instant,
 }
 
@@ -471,18 +473,21 @@ impl HostLimiter {
     /// Wait for a slot for `host` honoring `max_concurrent` and a minimum `delay`
     /// between request starts.
     pub async fn acquire(&self, host: &str, max_concurrent: u32, delay: Duration) -> HostPermit {
+        let limit = max_concurrent.max(1) as usize;
         let sem = {
             let mut map = self.inner.lock().unwrap();
             if map.len() > 4096 {
                 map.retain(|_, s| Arc::strong_count(&s.sem) > 1);
             }
-            map.entry(host.to_string())
-                .or_insert_with(|| HostSlot {
-                    sem: Arc::new(Semaphore::new(max_concurrent.max(1) as usize)),
-                    next_allowed: Instant::now(),
-                })
-                .sem
-                .clone()
+            let slot = map
+                .entry(host.to_string())
+                .or_insert_with(|| HostSlot { sem: Arc::new(Semaphore::new(limit)), limit, next_allowed: Instant::now() });
+            // A changed limit (settings) applies once the host is idle.
+            if slot.limit != limit && slot.sem.available_permits() == slot.limit {
+                slot.sem = Arc::new(Semaphore::new(limit));
+                slot.limit = limit;
+            }
+            slot.sem.clone()
         };
         let permit = sem.acquire_owned().await.expect("semaphore closed");
         loop {
@@ -584,6 +589,18 @@ fn charset_from_meta(head: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_limit_changes_apply_when_idle() {
+        let hosts = HostLimiter::default();
+        let a = hosts.acquire("h", 1, Duration::ZERO).await;
+        // Busy: a new limit does not apply yet, the second request waits.
+        assert!(tokio::time::timeout(Duration::from_millis(50), hosts.acquire("h", 2, Duration::ZERO)).await.is_err());
+        drop(a);
+        // Idle: the new limit of 2 applies.
+        let _b = hosts.acquire("h", 2, Duration::ZERO).await;
+        let _c = tokio::time::timeout(Duration::from_millis(200), hosts.acquire("h", 2, Duration::ZERO)).await.expect("second slot");
+    }
 
     #[test]
     fn private_ranges_blocked() {

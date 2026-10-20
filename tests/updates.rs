@@ -293,7 +293,7 @@ fn one_story(title: &str, body: &str) -> String {
 
 #[tokio::test]
 async fn reprocess_never_replaces_a_pending_update() {
-    use rillrss::pipeline::{ReprocessScope, reprocess_published, reprocess_story};
+    use rillrss::pipeline::{Queued, ReprocessScope, reprocess_published, reprocess_story};
     let mock = start_mock().await;
     let t = start_app(|s| s.updates.min_interval_min = 60).await;
     let body1 = paragraphs("Original", 3);
@@ -313,7 +313,7 @@ async fn reprocess_never_replaces_a_pending_update() {
     // Bulk reprocess (clicked twice) leaves it alone; a single-story reprocess only hurries it.
     assert_eq!(reprocess_published(&t.app, Some(fid), ReprocessScope::Latest(10), false).await.unwrap(), 0);
     assert_eq!(reprocess_published(&t.app, None, ReprocessScope::All, false).await.unwrap(), 0);
-    assert!(reprocess_story(&t.app, 1).await.unwrap());
+    assert_eq!(reprocess_story(&t.app, 1).await.unwrap(), Queued::Pending);
     assert_eq!(t.count("SELECT COUNT(*) FROM revisions").await, 2, "nothing re-queued");
     assert_eq!(t.count("SELECT priority FROM revisions WHERE state = 'pending'").await, 10);
 

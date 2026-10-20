@@ -398,8 +398,9 @@ pub async fn discover(app: &AppRef, url: &str) -> Result<Discovered> {
             .filter_map(|n| n.attr("href").and_then(|h| urlnorm::resolve(base.as_ref(), &h)))
             .collect()
     };
+    // Links from a public page must not lead into private space.
     for c in candidates.iter().take(3) {
-        if let Ok(f2) = http::get(&app.http.feed, c, &ua, timeout, max, false, FEED_ACCEPT).await
+        if let Ok(f2) = http::get(&app.http.feed, c, &ua, timeout, max, !f.private_ok, FEED_ACCEPT).await
             && f2.status < 400
             && let Ok(feed) = parse_feed(&f2.body, f2.final_url.as_ref())
         {

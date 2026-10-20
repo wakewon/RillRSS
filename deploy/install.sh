@@ -8,7 +8,7 @@ umask 077
 INSTALL_DIR=/opt/rillrss
 MIGRATE_FROM=
 KEEP_BACKUPS=3
-HEALTH_TIMEOUT=90
+HEALTH_TIMEOUT=300
 
 usage() {
     cat <<'EOF'
