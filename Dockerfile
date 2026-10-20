@@ -55,9 +55,13 @@ FROM ${RUNTIME_IMAGE}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /rillrss /usr/local/bin/rillrss
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/rillrss && mkdir -p /data
+# No RUN steps after the package install: a cross-built image then needs no
+# emulation beyond that cached layer (emulated chmod has failed with EIO).
+COPY --from=builder --chmod=0755 /rillrss /usr/local/bin/rillrss
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+# WORKDIR creates /data without running a process.
+WORKDIR /data
+WORKDIR /
 
 ENV RILL_DATA_DIR=/data \
     RILL_LISTEN=0.0.0.0:8080 \
