@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::app::{AppRef, EventRef, Level};
-use crate::content::translate::TranslateError;
+use crate::content::translate::{ArticleTranslation, TranslateError};
 use crate::content::{extract, sanitize};
 use crate::feeds::fetcher::{FeedRow, load_feed, user_agent};
 use crate::feeds::ingest::{self, assess_change};
@@ -730,15 +730,25 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
         }
     };
 
+    // Segments refused by content moderation are refused again on every attempt: when
+    // they are the only failures, the mixed result (translated where allowed, source
+    // text elsewhere) is final and is published now, also under "hold". A reprocess
+    // still keeps the current version rather than replace it with one translated nowhere.
+    let settled = |t: &ArticleTranslation| t.failed_segments == t.filtered_segments && !(reprocess && t.filtered_segments >= t.total_segments);
     match app.translator.translate_article(ts, &opts.target_lang, title_in, &html, bilingual).await {
-        Ok(t) if t.complete || (last_attempt && !hold && !reprocess) => {
+        Ok(t) if t.complete || settled(&t) || (last_attempt && !hold && !reprocess) => {
             let mut notes = Vec::new();
             if t.skipped_same_language {
                 notes.push("跳过翻译：已是目标语言".to_string());
             }
+            if t.filtered_segments > 0 {
+                notes.push(format!("{} / {} 段被翻译服务的内容审核拒绝，保留原文", t.filtered_segments, t.total_segments));
+            }
+            if t.failed_segments > t.filtered_segments {
+                notes.push(format!("翻译不完整：{} / {} 段保留原文", t.failed_segments - t.filtered_segments, t.total_segments));
+            }
             if !t.complete {
-                notes.push(format!("翻译不完整：{} / {} 段保留原文", t.failed_segments, t.total_segments));
-                app.event(Level::Warn, "translate", ev, format!("已发布部分翻译的文章（{} 段失败）", t.failed_segments)).await;
+                app.event(Level::Warn, "translate", ev, format!("已发布部分翻译的文章（{} 段保留原文）", t.failed_segments)).await;
             }
             if t.degraded_segments > 0 {
                 notes.push(format!("{} 段丢失了行内格式", t.degraded_segments));

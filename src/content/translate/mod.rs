@@ -55,6 +55,9 @@ pub struct ArticleTranslation {
     pub skipped_same_language: bool,
     pub total_segments: usize,
     pub failed_segments: usize,
+    /// Failed segments refused by the provider's content moderation (part of
+    /// `failed_segments`). Retrying will not change them.
+    pub filtered_segments: usize,
     pub degraded_segments: usize,
     pub cache_hits: usize,
     pub requests: usize,
@@ -602,6 +605,9 @@ impl Translator {
                 }
                 for (id, p) in o.failed {
                     result.failed_segments += 1;
+                    if p == Problem::Filtered {
+                        result.filtered_segments += 1;
+                    }
                     result.problems.push(format!("segment {id}: {}", p.as_str()));
                 }
                 // Batches that ended in an error still deliver what was validated before.
@@ -768,7 +774,8 @@ impl Translator {
                     if batch.len() > 1 {
                         return self.split(ctx, batch).await;
                     }
-                    outcome.failed.push((batch[0].id, Problem::Rejected));
+                    let p = if e.is_content_filter() { Problem::Filtered } else { Problem::Rejected };
+                    outcome.failed.push((batch[0].id, p));
                     return outcome;
                 }
                 Err(TranslateError::Api(ApiError::Unparseable { .. })) if self.circuit_open_for().is_none() => {
@@ -1421,7 +1428,8 @@ mod tests {
             }
         });
         let r = t.translate_article(&settings(), "zh-CN", None, ARTICLE, false).await.unwrap();
-        assert_eq!(r.problems, vec!["segment 2: rejected".to_string()]);
+        assert_eq!(r.problems, vec!["segment 2: filtered".to_string()]);
+        assert_eq!((r.failed_segments, r.filtered_segments), (1, 1));
         assert!(t.circuit_open_for().is_none());
     }
 

@@ -14,7 +14,7 @@ RillRSS 安装在一个固定目录（下文用 `/opt/rillrss`）。该目录保
 把发布包和同名的 `.sha256` 文件上传到服务器，在它们所在的目录执行（版本号按实际文件名填写）：
 
 ```sh
-VERSION=0.1.2
+VERSION=0.1.3
 sha256sum -c "rillrss-${VERSION}-linux-amd64.tar.gz.sha256"
 tar -xzf "rillrss-${VERSION}-linux-amd64.tar.gz"
 sudo "./rillrss-${VERSION}-linux-amd64/install.sh" --install-dir /opt/rillrss

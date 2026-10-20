@@ -176,6 +176,33 @@ async fn moderation_rejection_keeps_the_rest_of_the_article() {
 }
 
 #[tokio::test]
+async fn moderated_segments_publish_the_mixed_translation_at_once() {
+    // Zhipu GLM refuses one paragraph (code 1301). Refusals repeat on every attempt, so the
+    // mixed result is published on the first one, even under the "hold" policy.
+    let mock = start_mock().await;
+    let glm = json!({"contentFilter": [{"level": 1, "role": "assistant"}], "error": {"code": "1301", "message": "系统检测到输入或生成内容可能包含不安全或敏感内容，请您避免输入易产生敏感内容的提示语，感谢您的配合。"}}).to_string();
+    let (url, calls) = llm_mock(move |user| if user.contains("Opposition parties") { (400, glm.clone()) } else { completion(user) }).await;
+    let t = start_app(|s| {
+        llm_settings(&url)(s);
+        s.translation.on_failure = "hold".into();
+        s.translation.max_attempts = 3;
+    })
+    .await;
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(content.contains("Opposition parties") && !content.contains("prime minister"), "{content}");
+    let (attempts, notes): (i64, String) = t.query("SELECT attempts, notes FROM revisions", |r| Ok((r.get(0)?, r.get(1)?))).await;
+    assert_eq!(attempts, 0, "published without a retry");
+    assert!(notes.contains("内容审核") && !notes.contains("翻译不完整"), "{notes}");
+    // One batch, two halves, then single segments: a handful of requests, no retry rounds.
+    assert!(calls.load(Ordering::SeqCst) <= 6, "{} requests", calls.load(Ordering::SeqCst));
+    assert!(t.app.translator.circuit_open_for().is_none());
+}
+
+#[tokio::test]
 async fn context_errors_caused_by_max_tokens_pause_instead_of_splitting() {
     // max_tokens as large as the model's window (vLLM): every request fails however
     // small. Paused at once with a max_tokens hint instead of bisecting every batch.
