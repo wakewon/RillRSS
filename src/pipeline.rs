@@ -797,9 +797,13 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
         // "read since" queries pick it up) but stays listed and keeps its star: several
         // clients only learn read state from listings and unstar anything that vanishes
         // from the starred list. Hiding it from listings is optional.
+        // A reprocess (new settings, not news) of an article that was already read hides
+        // the old copy: every client already knows it is read, and lists don't double up.
+        let old_was_read = old.as_ref().is_some_and(|o| o.1 != 0);
+        let hide = us.hide_superseded || (rev.reason == "reprocess" && old_was_read);
         tx.execute(
             "UPDATE items SET superseded_by = ?, hidden = ?, read_at = CASE WHEN is_read = 0 THEN ? ELSE read_at END, is_read = 1 WHERE id = ?",
-            params![item_id, us.hide_superseded as i64, now, old_id],
+            params![item_id, hide as i64, now, old_id],
         )?;
         // Older generations point at the newest version too.
         tx.execute("UPDATE items SET superseded_by = ? WHERE story_id = ? AND superseded_by = ?", params![item_id, rev.story_id, old_id])?;
@@ -961,6 +965,7 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
     let created = app
         .db
         .write(move |tx| {
+            #[allow(clippy::type_complexity)]
             let latest: Option<(String, String, Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>)> = tx
                 .query_row(
                     "SELECT guid, title, link, author, published_at, entry_html, media FROM revisions WHERE story_id = ? ORDER BY id DESC LIMIT 1",
@@ -992,38 +997,131 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
 // Admin actions
 // ---------------------------------------------------------------------------
 
+/// Insert a 'reprocess' revision for a story from its latest source data.
+fn insert_reprocess(tx: &Transaction, story_id: i64, stage: &str, priority: i64, now: i64) -> Result<bool> {
+    #[allow(clippy::type_complexity)]
+    let latest: Option<(i64, String, String, Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT feed_id, guid, title, link, author, published_at, entry_html, media FROM revisions WHERE story_id = ? ORDER BY id DESC LIMIT 1",
+            [story_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        )
+        .optional()?;
+    let Some((feed_id, guid, title, link, author, published_at, entry_html, media)) = latest else { return Ok(false) };
+    ingest::obsolete_pending(tx, story_id, now)?;
+    tx.execute(
+        "INSERT INTO revisions (story_id, feed_id, reason, state, stage, priority, guid, title, link, author, published_at, entry_html, media,
+             next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, 'reprocess', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        params![story_id, feed_id, stage, priority, guid, title, link, author, published_at, entry_html, media, now, now],
+    )?;
+    tx.execute("UPDATE stories SET state = 'active' WHERE id = ? AND state = 'skipped'", [story_id])?;
+    Ok(true)
+}
+
 /// Re-run processing for a story from its latest source (publishes a new version).
 pub async fn reprocess_story(app: &AppRef, story_id: i64) -> Result<bool> {
     let now = util::now();
     let feed_id: i64 = app.db.call(move |c| Ok(c.query_row("SELECT feed_id FROM stories WHERE id = ?", [story_id], |r| r.get(0))?)).await?;
     let feed = app.db.call(move |c| load_feed(c, feed_id)).await?.ok_or_else(|| anyhow!("feed gone"))?;
     let stage = ingest::initial_stage(&feed.options);
-    let ok = app
-        .db
-        .write(move |tx| {
-            let latest: Option<(String, String, Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>)> = tx
-                .query_row(
-                    "SELECT guid, title, link, author, published_at, entry_html, media FROM revisions WHERE story_id = ? ORDER BY id DESC LIMIT 1",
-                    [story_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-                )
-                .optional()?;
-            let Some((guid, title, link, author, published_at, entry_html, media)) = latest else { return Ok(false) };
-            ingest::obsolete_pending(tx, story_id, now)?;
-            tx.execute(
-                "INSERT INTO revisions (story_id, feed_id, reason, state, stage, priority, guid, title, link, author, published_at, entry_html, media,
-                     next_attempt_at, created_at, updated_at)
-                 VALUES (?, ?, 'reprocess', 'pending', ?, 10, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                params![story_id, feed_id, stage, guid, title, link, author, published_at, entry_html, media, now, now],
-            )?;
-            tx.execute("UPDATE stories SET state = 'active' WHERE id = ? AND state = 'skipped'", [story_id])?;
-            Ok(true)
-        })
-        .await?;
+    let ok = app.db.write(move |tx| insert_reprocess(tx, story_id, stage, 10, now)).await?;
     if ok {
         app.wake_pipeline.notify_one();
     }
     Ok(ok)
+}
+
+/// Which published articles a bulk reprocess covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReprocessScope {
+    /// The newest N articles.
+    Latest(u32),
+    /// Articles first seen within the last N days.
+    Days(u32),
+    /// Every article still stored.
+    All,
+}
+
+impl ReprocessScope {
+    /// Parse "n50", "d7", "all".
+    pub fn parse(s: &str) -> ReprocessScope {
+        let s = s.trim();
+        if s == "all" {
+            return ReprocessScope::All;
+        }
+        if let Some(d) = s.strip_prefix('d').and_then(|x| x.parse::<u32>().ok()) {
+            return ReprocessScope::Days(d.max(1));
+        }
+        if let Some(n) = s.strip_prefix('n').and_then(|x| x.parse::<u32>().ok()) {
+            return ReprocessScope::Latest(n.max(1));
+        }
+        ReprocessScope::Latest(10)
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            ReprocessScope::Latest(n) => format!("最近 {n} 篇"),
+            ReprocessScope::Days(d) => format!("最近 {d} 天"),
+            ReprocessScope::All => "全部文章".into(),
+        }
+    }
+}
+
+/// Reprocess published articles of one feed (or all feeds) with the current settings.
+/// Each article is re-published as a new version that keeps its read/star state and
+/// date. Runs at low priority so fresh articles are not delayed. Returns the count.
+pub async fn reprocess_published(app: &AppRef, feed_id: Option<i64>, scope: ReprocessScope, unread_only: bool) -> Result<usize> {
+    let now = util::now();
+    let n = app
+        .db
+        .write(move |tx| {
+            let mut sql = String::from(
+                "SELECT s.id, f.options FROM stories s JOIN feeds f ON f.id = s.feed_id JOIN items i ON i.id = s.current_item_id
+                 WHERE s.state <> 'skipped'",
+            );
+            let mut p: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(f) = feed_id {
+                sql.push_str(" AND s.feed_id = ?");
+                p.push(f.into());
+            }
+            if unread_only {
+                sql.push_str(" AND i.is_read = 0");
+            }
+            if let ReprocessScope::Days(d) = scope {
+                sql.push_str(" AND s.first_seen_at >= ?");
+                p.push((now - d as i64 * 86400).into());
+            }
+            sql.push_str(" ORDER BY i.id DESC");
+            if let ReprocessScope::Latest(n) = scope {
+                sql.push_str(" LIMIT ?");
+                p.push((n as i64).into());
+            }
+            let rows: Vec<(i64, String)> = {
+                let mut st = tx.prepare(&sql)?;
+                st.query_map(rusqlite::params_from_iter(p), |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+            };
+            let mut n = 0;
+            for (story_id, opts) in rows {
+                let stage = ingest::initial_stage(&FeedOptions::from_json(&opts));
+                if insert_reprocess(tx, story_id, stage, -10, now)? {
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })
+        .await?;
+    if n > 0 {
+        app.wake_pipeline.notify_one();
+        app.event(
+            Level::Info,
+            "system",
+            feed_id.map(EventRef::feed).unwrap_or_default(),
+            format!("已安排重新处理 {n} 篇文章（范围：{}{}）", scope.label(), if unread_only { "，仅未读" } else { "" }),
+        )
+        .await;
+    }
+    Ok(n)
 }
 
 /// Retry failed revisions (all, or of one feed) immediately.

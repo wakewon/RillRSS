@@ -209,3 +209,75 @@ async fn entry_change_with_fulltext_confirms_on_page() {
     assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 1);
     assert_eq!(t.count("SELECT COUNT(*) FROM revisions WHERE state = 'unchanged'").await, 1);
 }
+
+#[tokio::test]
+async fn bulk_reprocess_scopes_keep_read_state() {
+    use rillrss::pipeline::{ReprocessScope, reprocess_published};
+    let mock = start_mock().await;
+    let t = start_app(|_| {}).await;
+    let entries: Vec<Entry> = (0..5)
+        .map(|i| {
+            let mut e = entry(&format!("t{i}"), &format!("法國新聞 {i}"), &format!("https://n.example.com/t{i}"), "<p>法國多地上週末爆發騷亂及搶掠，當局其後實施夜間宵禁。</p>");
+            e.pub_date = format!("Tue, 20 Oct 2026 0{i}:00:00 GMT");
+            e
+        })
+        .collect();
+    mock.set("/tw.xml", "application/rss+xml", rss("TW", &entries));
+    let fid = t.add_feed(&mock.url("/tw.xml"), json!({})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 5);
+    // Read the two oldest articles, star one.
+    t.app
+        .db
+        .call(|c| {
+            c.execute("UPDATE items SET is_read = 1, read_at = 1 WHERE title IN ('法國新聞 0', '法國新聞 1')", [])?;
+            c.execute("UPDATE items SET is_starred = 1 WHERE title = '法國新聞 0'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let published_before: i64 = t.count("SELECT published_at FROM items WHERE title = '法國新聞 0'").await;
+    // Settings change: enable Traditional -> Simplified conversion.
+    t.app.db.call(move |c| Ok(c.execute("UPDATE feeds SET options = '{\"opencc\":\"t2s\"}' WHERE id = ?", [fid])?)).await.unwrap();
+
+    // Latest 2 only.
+    assert_eq!(reprocess_published(&t.app, Some(fid), ReprocessScope::Latest(2), false).await.unwrap(), 2);
+    t.wait_idle().await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 7);
+    assert_eq!(t.count("SELECT COUNT(*) FROM items WHERE title LIKE '法国新闻%'").await, 2, "newest two converted");
+
+    // Unread only: the remaining unread unconverted article (and the two converted ones).
+    let n = reprocess_published(&t.app, Some(fid), ReprocessScope::All, true).await.unwrap();
+    assert_eq!(n, 3);
+    t.wait_idle().await;
+
+    // Everything else.
+    let n = reprocess_published(&t.app, Some(fid), ReprocessScope::All, false).await.unwrap();
+    assert_eq!(n, 5);
+    t.wait_idle().await;
+    let visible_current: i64 = t.count("SELECT COUNT(*) FROM items WHERE superseded_by IS NULL").await;
+    assert_eq!(visible_current, 5);
+    assert_eq!(t.count("SELECT COUNT(*) FROM items WHERE superseded_by IS NULL AND title LIKE '法国新闻%'").await, 5);
+    // Read state and stars are kept, no "[更新]" prefix, original dates kept.
+    let (read, starred, title, published): (i64, i64, String, i64) = t
+        .query("SELECT is_read, is_starred, title, published_at FROM items WHERE superseded_by IS NULL AND title = '法国新闻 0'", |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .await;
+    assert_eq!((read, starred, title.as_str()), (1, 1, "法国新闻 0"));
+    assert_eq!(published, published_before);
+    assert_eq!(t.count("SELECT COUNT(*) FROM items WHERE superseded_by IS NULL AND is_read = 0").await, 3, "unread stay unread");
+    // Old copies of already-read articles are hidden; unread ones stay listed (as read).
+    assert!(t.count("SELECT COUNT(*) FROM items WHERE superseded_by IS NOT NULL AND hidden = 0 AND is_read = 1").await >= 3);
+    assert!(t.count("SELECT COUNT(*) FROM items i WHERE superseded_by IS NOT NULL AND hidden = 1").await >= 2);
+}
+
+#[test]
+fn reprocess_scope_parsing() {
+    use rillrss::pipeline::ReprocessScope;
+    assert_eq!(ReprocessScope::parse("all"), ReprocessScope::All);
+    assert_eq!(ReprocessScope::parse("d7"), ReprocessScope::Days(7));
+    assert_eq!(ReprocessScope::parse("n200"), ReprocessScope::Latest(200));
+    assert_eq!(ReprocessScope::parse("bogus"), ReprocessScope::Latest(10));
+}
