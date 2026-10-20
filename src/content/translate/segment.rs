@@ -385,7 +385,7 @@ impl Segmented {
                     let node = NodeRef::new(*id, &self.doc.tree);
                     if bilingual {
                         let name = tag_name(&node).unwrap_or_default();
-                        if matches!(name.as_str(), "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "figcaption" | "div" | "dd" | "dt" | "section" | "header" | "footer" | "article" | "aside") {
+                        if matches!(name.as_str(), "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "div" | "dd" | "dt" | "section" | "header" | "footer" | "article" | "aside") {
                             let (open, close) = Builder::open_tag_html(&node);
                             node.after_html(format!("{open}{html}{close}"));
                         } else {

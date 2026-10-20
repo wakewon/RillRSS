@@ -18,7 +18,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace", "compression-gzip", "compression-br", "timeout", "limit", "set-header", "catch-panic"] }
 http = "1"
 bytes = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "brotli", "deflate", "json", "stream", "http2", "charset", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "brotli", "deflate", "json", "stream", "http2", "charset", "system-proxy", "form"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.35"

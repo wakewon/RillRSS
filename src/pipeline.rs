@@ -35,6 +35,11 @@ use crate::util::{self, text};
 
 pub const STAGES: [&str; 5] = ["extract", "transform", "translate", "images", "publish"];
 
+/// Time unit of retry back-off steps in milliseconds (1000 = seconds; tests lower it).
+pub static RETRY_UNIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+/// Dispatcher polling interval in milliseconds (tests lower it).
+pub static DISPATCH_TICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3000);
+
 #[derive(Debug, Clone)]
 pub struct Rev {
     pub id: i64,
@@ -108,6 +113,8 @@ enum Outcome {
 #[derive(Default)]
 struct Advance {
     next: &'static str,
+    /// Replacement media JSON (e.g. a better lead image found on the page).
+    media: Option<String>,
     content_html: Option<String>,
     title_out: Option<String>,
     source_text: Option<String>,
@@ -149,7 +156,8 @@ fn lease_secs(stage: &str) -> i64 {
 
 fn retry_backoff(attempts: i64) -> Duration {
     const STEPS: [u64; 7] = [60, 300, 900, 1800, 3600, 7200, 14400];
-    Duration::from_secs(STEPS[(attempts.max(0) as usize).min(STEPS.len() - 1)])
+    let unit = RETRY_UNIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    Duration::from_millis(STEPS[(attempts.max(0) as usize).min(STEPS.len() - 1)] * unit)
 }
 
 /// Dispatcher loop.
@@ -194,10 +202,11 @@ pub async fn run_dispatcher(app: AppRef) {
                 });
             }
         }
+        let tick = DISPATCH_TICK_MS.load(std::sync::atomic::Ordering::Relaxed);
         tokio::select! {
             _ = app.shutdown.cancelled() => break,
             _ = app.wake_pipeline.notified() => {},
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {},
+            _ = tokio::time::sleep(Duration::from_millis(tick)) => {},
         }
     }
 }
@@ -295,10 +304,10 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
                     all.extend(notes);
                     c.execute(
                         "UPDATE revisions SET stage = ?, content_html = COALESCE(?, content_html), title_out = COALESCE(?, title_out),
-                             source_text = COALESCE(?, source_text), lang = COALESCE(?, lang), notes = ?, attempts = 0,
+                             source_text = COALESCE(?, source_text), lang = COALESCE(?, lang), media = COALESCE(?, media), notes = ?, attempts = 0,
                              next_attempt_at = 0, lease_until = NULL, last_error = NULL, updated_at = ?
                          WHERE id = ? AND state = 'pending' AND stage = ?",
-                        params![a.next, a.content_html, a.title_out, a.source_text, a.lang, serde_json::to_string(&all)?, now, id, stage],
+                        params![a.next, a.content_html, a.title_out, a.source_text, a.lang, a.media, serde_json::to_string(&all)?, now, id, stage],
                     )?;
                     Ok(())
                 })
@@ -368,6 +377,8 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
 pub struct PageExtract {
     pub html: String,
     pub lang: Option<String>,
+    /// Lead image advertised by the page (og:image / JSON-LD).
+    pub image: Option<String>,
 }
 
 /// Errors from page extraction, classified for retry decisions.
@@ -382,7 +393,7 @@ pub async fn extract_page(app: &AppRef, settings: &Settings, feed: &FeedRow, lin
     let timeout = Duration::from_secs(settings.fetch.timeout_secs.max(5) as u64);
     if opts.fulltext == FulltextMode::External {
         return match extract::external(&app.http, &settings.fulltext.external_url, link, timeout * 2).await {
-            Ok(e) => Ok(PageExtract { html: e.html, lang: e.lang }),
+            Ok(e) => Ok(PageExtract { html: e.html, lang: e.lang, image: e.image }),
             Err(e) => Err(PageError::Transient(format!("external extractor: {e:#}"))),
         };
     }
@@ -422,7 +433,7 @@ pub async fn extract_page(app: &AppRef, settings: &Settings, feed: &FeedRow, lin
     .await
     .map_err(|e| PageError::Transient(format!("extractor panicked: {e}")))?;
     match res {
-        Ok(e) => Ok(PageExtract { html: e.html, lang: e.lang }),
+        Ok(e) => Ok(PageExtract { html: e.html, lang: e.lang, image: e.image }),
         Err(e) => Err(PageError::Permanent(format!("{e:#}"))),
     }
 }
@@ -479,8 +490,18 @@ async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
         }
         app.event(Level::Info, "update", EventRef::story(rev.feed_id, rev.story_id), format!("substantive update confirmed: {}", a.summary)).await;
     }
+    // Prefer the page's own lead image (usually high resolution) over the feed thumbnail.
+    let media = match extracted.image.as_deref().map(str::trim).filter(|i| i.starts_with("http")) {
+        Some(img) => {
+            let mut m = rev.media.clone();
+            m.thumbnail = Some(img.to_string());
+            m.to_json()
+        }
+        None => None,
+    };
     Ok(Outcome::Advance(Advance {
         next: "transform",
+        media,
         content_html: Some(html),
         source_text: Some(src),
         lang: extracted.lang,
@@ -582,7 +603,11 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
             error: format!("incomplete translation ({} of {} segments failed: {})", t.failed_segments, t.total_segments, t.problems.join(", ")),
             count_attempt: true,
         }),
-        Err(TranslateError::CircuitOpen(d)) => Ok(Outcome::Retry { delay: d.max(Duration::from_secs(30)), error: "translation service paused (circuit open)".into(), count_attempt: false }),
+        Err(TranslateError::CircuitOpen(d)) => Ok(Outcome::Retry {
+            delay: d.max(Duration::from_millis(30 * RETRY_UNIT_MS.load(std::sync::atomic::Ordering::Relaxed))),
+            error: "translation service paused (circuit open)".into(),
+            count_attempt: false,
+        }),
         Err(e) => {
             let msg = e.to_string();
             if last_attempt {
@@ -590,7 +615,7 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
                 return Ok(give_up(msg));
             }
             let delay = match &e {
-                TranslateError::NotConfigured => Duration::from_secs(600),
+                TranslateError::NotConfigured => Duration::from_millis(600 * RETRY_UNIT_MS.load(std::sync::atomic::Ordering::Relaxed)),
                 TranslateError::Api(api) => api.retry_after().unwrap_or_default().max(retry_backoff(rev.attempts)),
                 _ => retry_backoff(rev.attempts),
             };

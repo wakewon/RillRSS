@@ -33,8 +33,9 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || o[0] == 0
         || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64.0.0/10 CGNAT
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
-        || (o[0] == 198 && (o[1] & 0xFE) == 18) // 198.18.0.0/15 benchmarking
         || o[0] >= 240)
+    // Note: 198.18.0.0/15 (benchmarking) is deliberately allowed: "fake-IP" DNS of
+    // common proxy tools (Clash, Surge, sing-box TUN mode) maps every domain into it.
 }
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
@@ -360,7 +361,7 @@ mod tests {
         for ip in ["127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "64:ff9b::a00:1"] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip} should be blocked");
         }
-        for ip in ["8.8.8.8", "151.101.1.1", "2606:4700::1111", "64:ff9b::808:808"] {
+        for ip in ["8.8.8.8", "151.101.1.1", "2606:4700::1111", "64:ff9b::808:808", "198.18.17.182"] {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip} should be allowed");
         }
     }
