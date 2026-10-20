@@ -321,7 +321,7 @@ td .sub { color: var(--muted); font-size: 12px; }
   .shell { flex-direction: column; }
   .sidebar { position: sticky; top: 0; z-index: 10; width: 100%; height: auto; flex: 0 0 auto; flex-direction: row; align-items: center; gap: 6px; padding: 10px 14px; border-right: 0; border-bottom: 1px solid var(--border); }
   .brand { padding: 0 8px 0 0; }
-  .brand .brand-name { display: none; }
+  .sidebar .brand-name { display: none; }
   .nav { flex-direction: row; overflow-x: auto; scrollbar-width: none; gap: 2px; flex: 1; min-width: 0;
     -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent); padding-right: 22px; }
   .nav::-webkit-scrollbar { display: none; }
