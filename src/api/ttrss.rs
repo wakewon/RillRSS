@@ -241,7 +241,7 @@ async fn dispatch(app: &AppRef, req: &Req, op: &str, seq: Value, headers: &Heade
             ok(json!({"status": "OK", "updated": n}))
         }
         "getarticle" => {
-            let Some(ids) = req.int_list("article_id") else { return Ok(err(seq, "INCORRECT_USAGE")) };
+            let Some(ids) = req.int_list("article_id") else { return Ok(ok(json!([]))) };
             let base2 = base.clone();
             ok(app.db.call(move |c| get_article(c, &ids, &base2)).await?)
         }

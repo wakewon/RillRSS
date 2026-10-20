@@ -33,9 +33,9 @@ const STATE_STARRED: &str = "user/-/state/com.google/starred";
 const UNCATEGORIZED: &str = "Uncategorized";
 /// Content cap (News+ fails on huge items; FreshRSS uses the same limit).
 const MAX_CONTENT_BYTES: usize = 500_000;
-/// Slack applied to `ot` (seconds): items committed while a client was syncing may carry
-/// an insertion time slightly before the client's next `ot`.
-const OT_GRACE_SECS: i64 = 120;
+/// Slack applied to `ot` (seconds). Zero: some clients (Readrops) store re-sent items as
+/// duplicates; insertion times are strictly monotonic at commit instead.
+const OT_GRACE_SECS: i64 = 0;
 
 // ---------------------------------------------------------------------------
 // Ids
@@ -424,7 +424,7 @@ async fn route(app: &AppRef, method: &Method, path: &str, p: &Params, headers: &
         return Ok(text(StatusCode::OK, "PASS"));
     }
     if path == "/accounts/ClientLogin" {
-        return client_login(app, p, headers, peer).await;
+        return client_login(app, p, headers, peer, body).await;
     }
     if !authenticate(app, headers, p, method).await? {
         return Ok(unauthorized());
@@ -518,7 +518,34 @@ async fn route(app: &AppRef, method: &Method, path: &str, p: &Params, headers: &
     }
 }
 
-async fn client_login(app: &AppRef, p: &Params, headers: &HeaderMap, peer: SocketAddr) -> anyhow::Result<Response> {
+/// Minimal multipart/form-data field parser (some clients post ClientLogin that way).
+fn multipart_fields(content_type: &str, body: &[u8]) -> Vec<(String, String)> {
+    let Some(boundary) = content_type.split(';').find_map(|p| p.trim().strip_prefix("boundary=")).map(|b| b.trim_matches('"').to_string()) else {
+        return Vec::new();
+    };
+    let body = String::from_utf8_lossy(body);
+    let delim = format!("--{boundary}");
+    let mut out = Vec::new();
+    for part in body.split(&delim) {
+        let part = part.trim_start_matches("\r\n");
+        let Some((head, value)) = part.split_once("\r\n\r\n").or_else(|| part.split_once("\n\n")) else { continue };
+        let name = head
+            .split(';')
+            .find_map(|x| x.trim().strip_prefix("name="))
+            .map(|n| n.trim_matches('"').to_string());
+        if let Some(n) = name {
+            out.push((n, value.trim_end_matches("\r\n").trim_end_matches('\n').to_string()));
+        }
+    }
+    out
+}
+
+async fn client_login(app: &AppRef, p: &Params, headers: &HeaderMap, peer: SocketAddr, body: &Bytes) -> anyhow::Result<Response> {
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let mut p = p.clone();
+    if ct.to_ascii_lowercase().starts_with("multipart/form-data") {
+        p.0.extend(multipart_fields(ct, body));
+    }
     let (Some(user), Some(pass)) = (p.last("Email"), p.last("Passwd")) else {
         return Ok(text(StatusCode::BAD_REQUEST, "Bad Request!"));
     };
@@ -1019,6 +1046,13 @@ mod tests {
         assert_eq!(api_path("/reader/api/0//stream/items/ids"), "/reader/api/0/stream/items/ids");
         assert_eq!(api_path("/api/greader.php"), "");
         assert_eq!(api_path("/api/greader.php/"), "");
+    }
+
+    #[test]
+    fn multipart_login_fields() {
+        let body = "--XyZ\r\nContent-Disposition: form-data; name=\"Email\"\r\n\r\nadmin\r\n--XyZ\r\nContent-Disposition: form-data; name=\"Passwd\"\r\n\r\ns3cret\r\n--XyZ--\r\n";
+        let f = multipart_fields("multipart/form-data; boundary=XyZ", body.as_bytes());
+        assert_eq!(f, vec![("Email".to_string(), "admin".to_string()), ("Passwd".to_string(), "s3cret".to_string())]);
     }
 
     #[test]

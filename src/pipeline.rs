@@ -715,7 +715,10 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
         None => None,
     };
     let now = util::now();
-    let now_us = util::now_us();
+    // Strictly increasing insertion time (clients use it as a sync cursor); guards
+    // against clock steps.
+    let last_us: i64 = tx.query_row("SELECT COALESCE(MAX(created_at), 0) FROM items", [], |r| r.get(0))?;
+    let now_us = util::now_us().max(last_us + 1);
     let is_update = old.is_some();
     let real_update = is_update && rev.reason != "reprocess";
     let us = &settings.updates;
