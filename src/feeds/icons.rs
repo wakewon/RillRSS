@@ -8,6 +8,7 @@ use url::Url;
 
 use super::fetcher::FeedRow;
 use crate::app::AppRef;
+use crate::content::dom;
 use crate::http;
 use crate::util::{self, urlnorm};
 
@@ -74,27 +75,9 @@ async fn fetch_icon(app: &AppRef, site: &str, feed_image: Option<&str>) -> Resul
         && f.status < 400
     {
         let html = http::decode_html(&f.body, f.content_type().as_deref());
-        let doc = dom_query::Document::from(html.as_str());
-        let mut links: Vec<(i32, String)> = Vec::new();
-        for n in doc.select("link[rel]").nodes() {
-            let rel = n.attr("rel").map(|r| r.to_ascii_lowercase()).unwrap_or_default();
-            let Some(href) = n.attr("href") else { continue };
-            let score = if rel.contains("apple-touch-icon") {
-                3
-            } else if rel.split_whitespace().any(|r| r == "icon") {
-                2
-            } else {
-                continue;
-            };
-            if href.ends_with(".svg") {
-                continue;
-            }
-            if let Some(u) = urlnorm::resolve(Some(&f.final_url), &href) {
-                links.push((score, u));
-            }
-        }
-        links.sort_by_key(|l| std::cmp::Reverse(l.0));
-        candidates.extend(links.into_iter().map(|(_, u)| u));
+        let page_url = f.final_url.clone();
+        let links = tokio::task::spawn_blocking(move || icon_links(&html, &page_url)).await.unwrap_or_default();
+        candidates.extend(links);
     }
     if let Ok(u) = base.join("/favicon.ico") {
         candidates.push(u.to_string());
@@ -113,4 +96,47 @@ async fn fetch_icon(app: &AppRef, site: &str, feed_image: Option<&str>) -> Resul
         }
     }
     bail!("no usable icon")
+}
+
+/// `<link rel=icon>` URLs of a page, best first. Pages nested too deeply to parse cheaply
+/// yield none (the /favicon.ico fallback still applies).
+fn icon_links(html: &str, page_url: &Url) -> Vec<String> {
+    if dom::nesting_depth(html, dom::MAX_PAGE_DEPTH) > dom::MAX_PAGE_DEPTH {
+        return Vec::new();
+    }
+    let doc = dom_query::Document::from(html);
+    let mut links: Vec<(i32, String)> = Vec::new();
+    for n in doc.select("link[rel]").nodes() {
+        let rel = n.attr("rel").map(|r| r.to_ascii_lowercase()).unwrap_or_default();
+        let Some(href) = n.attr("href") else { continue };
+        let score = if rel.contains("apple-touch-icon") {
+            3
+        } else if rel.split_whitespace().any(|r| r == "icon") {
+            2
+        } else {
+            continue;
+        };
+        if href.ends_with(".svg") {
+            continue;
+        }
+        if let Some(u) = urlnorm::resolve(Some(page_url), &href) {
+            links.push((score, u));
+        }
+    }
+    links.sort_by_key(|l| std::cmp::Reverse(l.0));
+    links.into_iter().map(|(_, u)| u).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_icon_links_but_not_in_deep_pages() {
+        let url = Url::parse("https://site.example/blog/").unwrap();
+        let page = r#"<html><head><link rel="icon" href="/favicon.png"><link rel="apple-touch-icon" href="touch.png"><link rel="icon" href="/i.svg"></head><body>x</body></html>"#;
+        assert_eq!(icon_links(page, &url), ["https://site.example/blog/touch.png", "https://site.example/favicon.png"]);
+        let deep = page.replace("x", &"<div>".repeat(20_000));
+        assert!(icon_links(&deep, &url).is_empty());
+    }
 }

@@ -7,8 +7,8 @@ use ammonia::{Builder, UrlRelative};
 use regex::Regex;
 use url::Url;
 
-use super::dom::{fragment_html, parse_fragment, tag_name, unwrap_element};
-use crate::util::urlnorm;
+use super::dom::{MAX_CONTENT_DEPTH, MAX_PAGE_DEPTH, cap_depth, flatten_deep, fragment_html, parse_fragment, tag_name, unwrap_element};
+use crate::util::{html::base_href, urlnorm};
 
 const LAZY_SRC_ATTRS: &[&str] = &[
     "data-src",
@@ -41,24 +41,74 @@ pub struct SrcsetCandidate {
     pub density: f32,
 }
 
+/// Parse a `srcset` value like browsers do ("parse a srcset attribute"): a candidate's
+/// URL runs up to whitespace, so it may contain commas (image CDNs use `w_400,c_fill`),
+/// and its descriptors run up to the next comma. Candidates with invalid descriptors
+/// (including non-finite densities) are dropped.
 pub fn parse_srcset(srcset: &str) -> Vec<SrcsetCandidate> {
-    // URLs may contain commas (rare); split on ", " boundaries followed by a URL-ish token.
     let mut out = Vec::new();
-    for part in srcset.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
+    let mut rest = srcset;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+        if rest.is_empty() {
+            break;
+        }
+        let end = rest.find(|c: char| c.is_ascii_whitespace()).unwrap_or(rest.len());
+        let (mut url, after) = rest.split_at(end);
+        rest = after;
+        let mut descriptors: Vec<String> = Vec::new();
+        if url.ends_with(',') {
+            url = url.trim_end_matches(',');
+        } else {
+            let (mut cur, mut in_parens, mut consumed) = (String::new(), false, rest.len());
+            for (i, c) in rest.char_indices() {
+                if in_parens {
+                    cur.push(c);
+                    in_parens = c != ')';
+                } else if c.is_ascii_whitespace() {
+                    if !cur.is_empty() {
+                        descriptors.push(std::mem::take(&mut cur));
+                    }
+                } else if c == ',' {
+                    consumed = i + 1;
+                    break;
+                } else {
+                    in_parens = c == '(';
+                    cur.push(c);
+                }
+            }
+            if !cur.is_empty() {
+                descriptors.push(cur);
+            }
+            rest = &rest[consumed..];
+        }
+        if url.is_empty() {
             continue;
         }
-        let mut it = part.split_whitespace();
-        let Some(url) = it.next() else { continue };
-        let desc = it.next().unwrap_or("");
-        let (mut width, mut density) = (0u32, 0f32);
-        if let Some(w) = desc.strip_suffix('w') {
-            width = w.parse().unwrap_or(0);
-        } else if let Some(x) = desc.strip_suffix('x') {
-            density = x.parse().unwrap_or(0.0);
+        let (mut width, mut density, mut height, mut ok) = (None, None, false, true);
+        for d in &descriptors {
+            let kind = d.as_bytes()[d.len() - 1];
+            if !kind.is_ascii() {
+                ok = false;
+                break;
+            }
+            let num = &d[..d.len() - 1];
+            match kind {
+                b'w' if width.is_none() && density.is_none() && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) => {
+                    width = num.parse::<u32>().ok().filter(|w| *w > 0);
+                    ok &= width.is_some();
+                }
+                b'x' if width.is_none() && density.is_none() => {
+                    density = num.parse::<f32>().ok().filter(|x| x.is_finite() && *x > 0.0);
+                    ok &= density.is_some();
+                }
+                b'h' if !height && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) => height = true,
+                _ => ok = false,
+            }
         }
-        out.push(SrcsetCandidate { url: url.to_string(), width, density });
+        if ok && !(height && width.is_none()) {
+            out.push(SrcsetCandidate { url: url.to_string(), width: width.unwrap_or(0), density: density.unwrap_or(0.0) });
+        }
     }
     out
 }
@@ -80,7 +130,7 @@ pub fn best_from_srcset(srcset: &str) -> Option<String> {
             .map(|x| x.url.clone());
     }
     let mut ds: Vec<&SrcsetCandidate> = c.iter().collect();
-    ds.sort_by(|a, b| a.density.partial_cmp(&b.density).unwrap_or(std::cmp::Ordering::Equal));
+    ds.sort_by(|a, b| a.density.total_cmp(&b.density));
     ds.iter().find(|x| x.density >= 2.0).or(ds.last()).map(|x| x.url.clone())
 }
 
@@ -102,15 +152,15 @@ fn resolve_srcset(srcset: &str, base: Option<&Url>) -> String {
 }
 
 /// DOM-level cleanup before sanitizing: lazy images, <picture>, <noscript>, embeds,
-/// removal of non-content elements.
+/// removal of non-content elements, and a cap on nesting depth.
 pub fn preprocess(html: &str, base: Option<&Url>) -> String {
-    let doc = parse_fragment(html);
+    let doc = parse_fragment(&flatten_deep(html, MAX_PAGE_DEPTH));
 
     // Unwrap <noscript> (often contains the real <img>).
     for n in doc.select("noscript").nodes().to_vec() {
         let inner = n.text().to_string();
         if inner.contains("<img") {
-            n.replace_with_html(inner);
+            n.replace_with_html(flatten_deep(&inner, MAX_PAGE_DEPTH).into_owned());
         } else {
             unwrap_element(&n);
         }
@@ -208,6 +258,10 @@ pub fn preprocess(html: &str, base: Option<&Url>) -> String {
     if let Some(sel) = doc.try_select("script, style, link, meta, form, input, button, select, textarea, svg, canvas, object, embed, template, nav, dialog") {
         sel.remove();
     }
+    // Later stages (translation, readers) walk the tree recursively.
+    if let Some(root) = doc.root().first_child() {
+        cap_depth(&root, MAX_CONTENT_DEPTH);
+    }
     fragment_html(&doc)
 }
 
@@ -238,22 +292,38 @@ fn builder(base: Option<&Url>) -> Builder<'static> {
 }
 
 /// Full cleanup: preprocess + allowlist sanitization + empty-element pruning.
+/// Relative URLs resolve against a `<base href>` in the fragment (extraction adds one for
+/// the page's final address), else against `base`.
 pub fn sanitize(html: &str, base: Option<&Url>) -> String {
+    let own_base = base_href(html)
+        .and_then(|h| match base {
+            Some(b) => b.join(&h).ok(),
+            None => Url::parse(&h).ok(),
+        })
+        .filter(|u| matches!(u.scheme(), "http" | "https"));
+    let base = own_base.as_ref().or(base);
     let pre = preprocess(html, base);
     let clean = builder(base).clean(&pre).to_string();
     prune_empty(&clean)
 }
 
-/// Remove empty paragraphs/divs/spans that only contain whitespace.
+/// Remove empty paragraphs/divs/spans that only contain whitespace. Inline elements
+/// holding only whitespace become a single space: it may be all that separates words.
 fn prune_empty(html: &str) -> String {
     let doc = parse_fragment(html);
     for _ in 0..3 {
         let mut changed = false;
-        for n in doc.select("p, div, span, section, figure, figcaption, li, strong, b, em, i, a, blockquote, header, footer, aside").nodes().to_vec() {
-            if n.text().trim().is_empty()
+        // Innermost first, so nothing is changed inside an already removed element.
+        for n in doc.select("p, div, span, section, figure, figcaption, li, strong, b, em, i, a, blockquote, header, footer, aside").nodes().iter().rev() {
+            let text = n.text();
+            if text.trim().is_empty()
                 && !n.descendants().iter().any(|d| matches!(tag_name(d).as_deref(), Some("img" | "video" | "audio" | "br" | "hr" | "table")))
             {
-                n.remove_from_parent();
+                if !text.is_empty() && matches!(tag_name(n).as_deref(), Some("span" | "strong" | "b" | "em" | "i" | "a")) {
+                    n.replace_with_html(" ");
+                } else {
+                    n.remove_from_parent();
+                }
                 changed = true;
             }
         }
@@ -333,5 +403,74 @@ mod tests {
     fn prunes_empty_elements() {
         let out = sanitize("<p> </p><div><span></span></div><p>text</p><p><img src=\"https://x.com/a.png\"></p>", None);
         assert_eq!(out, "<p>text</p><p><img src=\"https://x.com/a.png\"></p>");
+    }
+
+    #[test]
+    fn whitespace_only_inline_elements_keep_the_space() {
+        assert_eq!(sanitize("<p>Hello<span> </span>world</p>", None), "<p>Hello world</p>");
+        assert_eq!(sanitize("<p>The<a href=\"https://x.example/\"> </a>quick <b>&nbsp;</b>fox</p>", None), "<p>The quick  fox</p>");
+        assert_eq!(sanitize("<p><strong>Breaking:</strong><em> </em>News</p><p><span> <b> </b> </span></p>", None), "<p><strong>Breaking:</strong> News</p>");
+    }
+
+    #[test]
+    fn srcset_urls_may_contain_commas() {
+        let ss = "https://res.cloudinary.com/demo/image/upload/w_400,c_fill/v1/photo.jpg 400w, https://res.cloudinary.com/demo/image/upload/w_1200,c_fill/v1/photo.jpg 1200w";
+        let c = parse_srcset(ss);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[1].url, "https://res.cloudinary.com/demo/image/upload/w_1200,c_fill/v1/photo.jpg");
+        assert_eq!(c[1].width, 1200);
+        assert_eq!(best_from_srcset(ss).as_deref(), Some("https://res.cloudinary.com/demo/image/upload/w_1200,c_fill/v1/photo.jpg"));
+        // Without descriptors, trailing commas end the URL.
+        let urls: Vec<String> = parse_srcset("a.jpg,, b.jpg 2x,, c.jpg").into_iter().map(|c| c.url).collect();
+        assert_eq!(urls, ["a.jpg", "b.jpg", "c.jpg"]);
+        let out = sanitize(&format!(r#"<img src="data:image/gif;base64,R0lGOD" data-srcset="{ss}">"#), Some(&base()));
+        assert!(out.contains(r#"src="https://res.cloudinary.com/demo/image/upload/w_1200,c_fill/v1/photo.jpg""#), "{out}");
+        assert!(out.contains("w_400,c_fill/v1/photo.jpg 400w, https://res.cloudinary.com/demo/image/upload/w_1200,c_fill/v1/photo.jpg 1200w"), "{out}");
+    }
+
+    #[test]
+    fn invalid_srcset_descriptors_are_dropped() {
+        let c = parse_srcset("a.jpg NaNx, b.jpg infx, c.jpg -1x, d.jpg 0w, e.jpg 2é, f.jpg 1.5x, g.jpg 100w 2x, h.jpg (x, y) 2x");
+        let urls: Vec<&str> = c.iter().map(|c| c.url.as_str()).collect();
+        assert_eq!(urls, ["f.jpg"]);
+        // Many candidates with NaN densities used to make the sort panic.
+        let ss = (0..60).map(|i| format!("i{i}.jpg {}x", if i % 3 == 0 { "NaN".to_string() } else { format!("{}", i % 7 + 1) })).collect::<Vec<_>>().join(", ");
+        assert_eq!(best_from_srcset(&ss).as_deref(), Some("i1.jpg"));
+        assert!(sanitize(&format!("<img src=\"\" srcset=\"{ss}\">"), None).contains("<img"));
+    }
+
+    #[test]
+    fn fragment_base_wins() {
+        let h = r#"<base href="https://www.site.example/2024/10/story.html"><p>a</p><img src="img/a.jpg"><img data-src="/lazy/1.jpg" src="data:image/gif;base64,R0lGOD"><a href="related.html">r</a>"#;
+        let out = sanitize(h, Some(&Url::parse("https://feeds.example.net/r/abc").unwrap()));
+        assert!(out.contains("https://www.site.example/2024/10/img/a.jpg"), "{out}");
+        assert!(out.contains("https://www.site.example/lazy/1.jpg"), "{out}");
+        assert!(out.contains("https://www.site.example/2024/10/related.html"), "{out}");
+        assert!(!out.contains("<base"), "{out}");
+        // A relative <base> resolves against the given base; other schemes are ignored.
+        let out = sanitize(r#"<base href="/blog/"><img src="x.png">"#, Some(&base()));
+        assert!(out.contains("https://news.example.com/blog/x.png"), "{out}");
+        let out = sanitize(r#"<base href="javascript:alert(1)//"><img src="x.png">"#, Some(&base()));
+        assert!(out.contains("https://news.example.com/a/x.png"), "{out}");
+    }
+
+    #[test]
+    fn caps_nesting_depth() {
+        use crate::content::dom::tree_depth;
+        let depth = |html: &str| {
+            let doc = parse_fragment(html);
+            tree_depth(&doc.root().first_child().unwrap(), usize::MAX)
+        };
+        for n in [300, 8000] {
+            let h = format!("<p>intro</p>{}deep text{}", "<div>".repeat(n), "</div>".repeat(n));
+            let out = sanitize(&h, None);
+            assert!(depth(&out) <= MAX_CONTENT_DEPTH, "{n}: {}", depth(&out));
+            assert!(out.contains("deep text") && out.contains("intro"));
+        }
+        // Markup hidden as text in <noscript> is re-parsed: it is capped as well.
+        let h = format!("<noscript>&lt;img src=\"https://x.example/a.png\"&gt;{}x</noscript>", "&lt;div&gt;".repeat(3000));
+        let out = sanitize(&h, None);
+        assert!(depth(&out) <= MAX_CONTENT_DEPTH, "{}", depth(&out));
+        assert!(out.contains("https://x.example/a.png"));
     }
 }

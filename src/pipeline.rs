@@ -497,7 +497,7 @@ pub async fn extract_page(app: &AppRef, settings: &Settings, feed: &FeedRow, lin
     let selector = opts.selector.clone();
     let res = tokio::task::spawn_blocking(move || -> Result<extract::Extracted> {
         match mode {
-            FulltextMode::Selector => extract::by_selector(&html, &selector).or_else(|_| extract::readability(&html, &final_url)),
+            FulltextMode::Selector => extract::by_selector(&html, &selector, &final_url).or_else(|_| extract::readability(&html, &final_url)),
             _ => extract::readability(&html, &final_url),
         }
     })

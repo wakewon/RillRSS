@@ -109,20 +109,19 @@ pub fn guid_key(raw: &str, link: Option<&str>) -> String {
     g.to_string()
 }
 
-/// Resolve a possibly-relative URL against a base.
+/// Resolve a possibly-relative URL against a base. Only http(s) URLs are returned:
+/// links, images and feeds use nothing else, and this keeps `javascript:` (in any case
+/// or spacing) and `data:` out of stored links.
 pub fn resolve(base: Option<&Url>, href: &str) -> Option<String> {
     let href = href.trim();
     if href.is_empty() {
         return None;
     }
-    if href.starts_with("data:") || href.starts_with("javascript:") {
-        return None;
-    }
-    if let Ok(u) = Url::parse(href) {
-        return Some(u.to_string());
-    }
-    let base = base?;
-    base.join(href).ok().map(|u| u.to_string())
+    let url = match Url::parse(href) {
+        Ok(u) => u,
+        Err(_) => base?.join(href).ok()?,
+    };
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
 }
 
 /// Extract the host of a URL (lowercase), if any.

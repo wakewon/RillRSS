@@ -49,18 +49,19 @@ pub fn html_to_text(html: &str) -> String {
                 .to_ascii_lowercase();
             i += end_rel + 1;
             if !closing && (name == "script" || name == "style" || name == "noscript" || name == "template") {
+                // Skip to the close tag, matching it case-insensitively in place (copying
+                // the rest of the document for every such element made this quadratic).
                 let close = format!("</{name}");
-                let lower_rest = html[i..].to_ascii_lowercase();
-                match lower_rest.find(&close) {
+                i = match find_ignore_ascii_case(&bytes[i..], close.as_bytes()) {
                     Some(pos) => {
                         let after = i + pos;
-                        i = match html[after..].find('>') {
+                        match html[after..].find('>') {
                             Some(e) => after + e + 1,
                             None => bytes.len(),
-                        };
+                        }
                     }
-                    None => i = bytes.len(),
-                }
+                    None => bytes.len(),
+                };
             } else if BLOCK_TAGS.contains(&name.as_str()) {
                 out.push('\n');
             } else if name == "img" {
@@ -76,6 +77,19 @@ pub fn html_to_text(html: &str) -> String {
     }
     let decoded = html_escape::decode_html_entities(&out);
     collapse_whitespace(&decoded)
+}
+
+/// Position of `needle` (which starts with '<') in `hay`, ignoring ASCII case.
+fn find_ignore_ascii_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(p) = hay[from..].iter().position(|&b| b == b'<') {
+        let at = from + p;
+        if hay.len() - at >= needle.len() && hay[at..at + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
 }
 
 /// Collapse runs of horizontal whitespace into one space and runs of newlines into one,
@@ -305,6 +319,17 @@ mod tests {
         assert_eq!(html_to_text(h), "Hello world\nSecond para & more");
         assert_eq!(html_to_text("a<br>b"), "a\nb");
         assert_eq!(html_to_text("<style>p{}</style>x"), "x");
+        assert_eq!(html_to_text("<SCRIPT>if (a < b) {}</Script >é<noscript><p>no</noscript>ü<style>"), "éü");
+    }
+
+    #[test]
+    fn html_to_text_is_linear_in_raw_text_elements() {
+        // 4 MB of empty style elements: quadratic before (the rest of the document was
+        // copied for each one), well under a second now.
+        let h = format!("{}<p>end</p>", "<style></style>".repeat(4 << 20 >> 4));
+        let t = std::time::Instant::now();
+        assert_eq!(html_to_text(&h), "end");
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
     }
 
     #[test]
