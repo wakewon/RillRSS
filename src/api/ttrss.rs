@@ -420,7 +420,7 @@ fn target_of(fid: &Value, is_cat: bool) -> Target {
             _ => Target::Nothing,
         };
     };
-    if id <= LABEL_BASE - 1 {
+    if id < LABEL_BASE {
         return Target::Label(-id + LABEL_BASE); // |id| - 1025
     }
     if is_cat {
@@ -503,7 +503,7 @@ fn global_or_counter(conn: &Connection, fid: &Value, is_cat: bool) -> anyhow::Re
         _ => false,
     };
     if falsy {
-        return Ok(ItemQuery { read: Some(false), ..Default::default() }.count(conn)?);
+        return ItemQuery { read: Some(false), ..Default::default() }.count(conn);
     }
     counter(conn, &target_of(fid, is_cat))
 }
@@ -783,11 +783,10 @@ fn headline_query(c: &Connection, p: &HeadlineParams) -> anyhow::Result<Option<(
         "marked" => q.starred = Some(true),
         "published" => q.published_flag = Some(true),
         "has_note" => q.has_note = true,
-        "adaptive" if p.search.is_empty() && t != Target::Starred => {
-            if counter(c, &t)? > 0 {
+        "adaptive" if p.search.is_empty() && t != Target::Starred
+            && counter(c, &t)? > 0 => {
                 q.read = Some(false);
             }
-        }
         _ => {}
     }
     if p.since_id > 0 {
@@ -834,7 +833,7 @@ fn attachments(it: &ItemRow) -> Vec<Value> {
 
 fn labels_json(it: &ItemRow) -> Vec<Value> {
     let mut l: Vec<&(i64, String)> = it.labels.iter().collect();
-    l.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    l.sort_by_key(|a| a.1.to_lowercase());
     l.iter().map(|(id, name)| json!([LABEL_BASE - id, name, "", ""])).collect()
 }
 
@@ -968,7 +967,7 @@ fn update_article(tx: &rusqlite::Transaction, ids: &[i64], mode: i64, field: i64
     let existing: Vec<i64> = ItemQuery { id_in: Some(ids.to_vec()), include_hidden: true, ..Default::default() }.ids(tx)?;
     let items = store::load_items(tx, &existing, false)?;
     match field {
-        0 | 1 | 2 => {
+        0..=2 => {
             for it in &items {
                 let cur = match field {
                     0 => it.is_starred,

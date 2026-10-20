@@ -16,6 +16,7 @@ pub const DEFAULT_USER_AGENT: &str =
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Settings {
     /// Public base URL override (takes precedence over RILL_BASE_URL when set).
     pub base_url: String,
@@ -27,19 +28,6 @@ pub struct Settings {
     pub updates: UpdateSettings,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Settings {
-            base_url: String::new(),
-            fetch: FetchSettings::default(),
-            retention: RetentionSettings::default(),
-            fulltext: FulltextSettings::default(),
-            translation: TranslationSettings::default(),
-            images: ImageSettings::default(),
-            updates: UpdateSettings::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]

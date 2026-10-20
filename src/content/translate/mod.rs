@@ -425,7 +425,7 @@ impl Translator {
             };
             let batches = make_batches(&misses, settings.max_batch_chars as usize, settings.max_batch_segments as usize);
             let conc = settings.max_concurrency.clamp(1, 8) as usize;
-            let outcomes: Vec<Result<BatchOutcome, TranslateError>> = futures::stream::iter(batches.into_iter())
+            let outcomes: Vec<Result<BatchOutcome, TranslateError>> = futures::stream::iter(batches)
                 .map(|b| {
                     let ctx = &ctx;
                     async move { self.translate_batch(ctx, b, 0, false).await }
@@ -474,16 +474,11 @@ impl Translator {
             }
         }
 
-        result.title = match title {
-            Some(t) => Some(
-                translations
+        result.title = title.map(|t| translations
                     .get(&0)
                     .map(|tr| html_escape::decode_html_entities(&segment::strip_placeholders(tr)).trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| t.to_string()),
-            ),
-            None => None,
-        };
+                    .unwrap_or_else(|| t.to_string()));
         translations.remove(&0);
         result.complete = result.failed_segments == 0;
         result.html = segment_html(html).apply(&translations, bilingual);

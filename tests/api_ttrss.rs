@@ -157,7 +157,7 @@ async fn headlines_paging_and_updates() {
     let unread_first = t.tt_op(&sid, json!({"op": "getCompactHeadlines", "feed_id": -4, "view_mode": "unread_first"})).await;
     assert_eq!(unread_first.as_array().unwrap().len(), 4);
     // labels
-    t.app.db.call(|c| Ok(rillrss::store::ensure_label(c, "Later")?)).await.unwrap();
+    t.app.db.call(|c| rillrss::store::ensure_label(c, "Later")).await.unwrap();
     let labels = t.tt_op(&sid, json!({"op": "getLabels", "article_id": ids[0]})).await;
     assert_eq!(labels[0]["id"], -1026);
     assert_eq!(labels[0]["checked"], false);

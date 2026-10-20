@@ -387,7 +387,7 @@ pub async fn discover(app: &AppRef, url: &str) -> Result<Discovered> {
     for c in candidates.iter().take(3) {
         if let Ok(f2) = http::get(&app.http.feed, c, &ua, timeout, max, false, FEED_ACCEPT).await
             && f2.status < 400
-            && let Ok(feed) = parse_feed(&f2.body, &f2.final_url.to_string())
+            && let Ok(feed) = parse_feed(&f2.body, f2.final_url.as_ref())
         {
             return Ok(Discovered { url: f2.final_url.to_string(), title: feed.title });
         }

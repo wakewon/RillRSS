@@ -223,7 +223,7 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
     let min_published = if fetch.max_entry_age_days > 0 { now - fetch.max_entry_age_days as i64 * 86400 } else { i64::MIN };
 
     // 3. Process oldest first so that publication order roughly follows story order.
-    prepared.sort_by(|a, b| a.published.cmp(&b.published));
+    prepared.sort_by_key(|a| a.published);
     let track_updates = ctx.opts.updates != UpdateMode::Off;
     let fulltext = ctx.opts.fulltext != FulltextMode::Off;
 
@@ -422,7 +422,7 @@ mod tests {
         publish_all(&db, now);
         // Same article moved to another front-page section: '#2'
         let e2 = entry("https://www.bbc.co.uk/news/articles/abc#2", "Curfew in Paris", "https://www.bbc.co.uk/news/articles/abc?at_medium=RSS&at_campaign=rss", BODY, now - 100);
-        let r = run(&db, fid, &opts, &settings, now + 600, &[e2.clone()]);
+        let r = run(&db, fid, &opts, &settings, now + 600, std::slice::from_ref(&e2));
         assert_eq!(r.new_stories, 0);
         assert_eq!(r.updates, 0);
         // Both '#1' and '#3' in the same document -> still one story.

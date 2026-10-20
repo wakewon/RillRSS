@@ -147,14 +147,13 @@ pub fn check_segment(seg: &Segment, out: Option<&str>, target: &str) -> Option<P
             }
         } else if !tgt_cjk && src_cjk && out_cjk > 0.5 {
             return Some(Problem::Untranslated);
-        } else if !tgt_cjk && !src_cjk && out_plain.chars().count() >= 60 {
-            if let (Some(sl), Some(ol)) = (lang::detect(&src_plain), lang::detect(&out_plain))
+        } else if !tgt_cjk && !src_cjk && out_plain.chars().count() >= 60
+            && let (Some(sl), Some(ol)) = (lang::detect(&src_plain), lang::detect(&out_plain))
                 && sl == ol
                 && Some(ol) != lang::whatlang_of(target)
             {
                 return Some(Problem::Untranslated);
             }
-        }
     }
 
     // Generation loops.

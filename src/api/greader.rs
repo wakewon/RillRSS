@@ -61,10 +61,9 @@ pub fn parse_item_id(raw: &str) -> Option<i64> {
         s.parse::<i64>().ok()?
     } else if s.len() <= 16 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         u64::from_str_radix(s, 16).ok()? as i64
-    } else if let Some(last) = s.rsplit('/').next().filter(|l| l.len() <= 16 && l.chars().all(|c| c.is_ascii_hexdigit())) {
-        u64::from_str_radix(last, 16).ok()? as i64
     } else {
-        return None;
+        let last = s.rsplit('/').next().filter(|l| l.len() <= 16 && l.chars().all(|c| c.is_ascii_hexdigit()))?;
+        u64::from_str_radix(last, 16).ok()? as i64
     };
     if value >= GREADER_ID_OFFSET {
         Some(value - GREADER_ID_OFFSET)
