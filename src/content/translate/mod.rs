@@ -159,10 +159,12 @@ impl Breaker {
             return;
         }
         self.consecutive_failures += 1;
-        let threshold = if err.is_auth() { 1 } else { 5 };
+        // Bad credentials / quota / invalid request parameters fail every request until
+        // the configuration changes: pause at once instead of hammering the provider.
+        let threshold = if err.needs_operator() { 1 } else { 5 };
         if self.consecutive_failures >= threshold {
             self.open_count += 1;
-            let base = if err.is_auth() { 600 } else { 30 };
+            let base = if err.needs_operator() { 600 } else { 30 };
             let secs = (base * 2u64.pow(self.open_count.min(6) - 1)).min(1800);
             let secs = secs.max(err.retry_after().map(|d| d.as_secs()).unwrap_or(0));
             self.open_until = Some(Instant::now() + Duration::from_secs(secs));
@@ -180,6 +182,8 @@ pub struct TranslatorStats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub last_error: Option<String>,
+    /// What to check for the last error, when it needs the operator.
+    pub last_error_hint: Option<&'static str>,
     pub last_error_at: Option<i64>,
     pub last_success_at: Option<i64>,
 }
@@ -377,6 +381,12 @@ impl Translator {
     ) -> Result<ArticleTranslation, TranslateError> {
         let backend = self.make_backend(settings)?;
         let model = backend.model_id();
+        // Cache namespace: a changed glossary/style prompt must not reuse old output
+        // (an empty prompt keeps the historic key, so existing caches stay valid).
+        let cache_ns = match settings.extra_prompt.trim() {
+            "" => model.clone(),
+            p => format!("{model}\0{p}"),
+        };
         // The parsed document is not Send; keep only the segments across awaits and
         // re-segment (deterministically) when applying the translations.
         let mut segments: Vec<Segment> = segment_html(html).segments;
@@ -399,7 +409,7 @@ impl Translator {
         }
 
         // Cache lookup.
-        let keys: Vec<String> = segments.iter().map(|s| Self::cache_key(&model, target, &s.text)).collect();
+        let keys: Vec<String> = segments.iter().map(|s| Self::cache_key(&cache_ns, target, &s.text)).collect();
         let cached = self.cache_get(keys.clone()).await.map_err(|e| TranslateError::Other(e.to_string()))?;
         let mut translations: HashMap<usize, String> = HashMap::new();
         let mut misses: Vec<Segment> = Vec::new();
@@ -441,7 +451,7 @@ impl Translator {
                         for (id, text, degraded) in o.good {
                             if let Some(s) = misses.iter().find(|s| s.id == id) {
                                 if !degraded {
-                                    to_cache.push((Self::cache_key(&model, target, &s.text), s.text.clone(), text.clone()));
+                                    to_cache.push((Self::cache_key(&cache_ns, target, &s.text), s.text.clone(), text.clone()));
                                 } else {
                                     result.degraded_segments += 1;
                                 }
@@ -518,6 +528,10 @@ impl Translator {
             }
             let res = {
                 let _g = self.limiter.acquire(ctx.settings.max_concurrency, ctx.settings.requests_per_minute).await;
+                // The circuit may have opened while this request waited for a slot.
+                if let Err(wait) = self.breaker.lock().unwrap().check() {
+                    return Err(TranslateError::CircuitOpen(wait));
+                }
                 ctx.backend.chat(req.clone()).await
             };
             match res {
@@ -536,6 +550,7 @@ impl Translator {
                         st.requests += 1;
                         st.failures += 1;
                         st.last_error = Some(e.to_string());
+                        st.last_error_hint = e.hint();
                         st.last_error_at = Some(util::now());
                     }
                     self.breaker.lock().unwrap().failure(&e);
@@ -575,10 +590,17 @@ impl Translator {
             let refs: Vec<&Segment> = batch.iter().collect();
             let resp = match self.call(ctx, &refs, retry || tries > 0).await {
                 Ok(r) => r,
-                Err(TranslateError::Api(e)) if !e.is_transient() && !e.is_provider_failure() && batch.len() > 1 => {
-                    // e.g. 400 "context too long": split
-                    return self.split(ctx, batch).await;
+                Err(TranslateError::Api(e)) if e.is_context_length() || e.is_content_filter() => {
+                    // Too long for the model, or refused by moderation: bisect so the rest
+                    // of the article still gets translated.
+                    if batch.len() > 1 {
+                        return self.split(ctx, batch).await;
+                    }
+                    outcome.failed.push((batch[0].id, Problem::Rejected));
+                    return Ok(outcome);
                 }
+                // Configuration, auth and transport errors abort the article (no splitting:
+                // every smaller request would fail the same way).
                 Err(e) => return Err(e),
             };
             let truncated = resp.finish_reason.as_deref() == Some("length");

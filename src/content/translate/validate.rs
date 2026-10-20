@@ -24,6 +24,8 @@ pub enum Problem {
     ContainsSource,
     /// Same output as a neighbouring segment with different source (misalignment).
     Misaligned,
+    /// The provider refused the segment (too long / moderation).
+    Rejected,
 }
 
 impl Problem {
@@ -38,6 +40,7 @@ impl Problem {
             Problem::TooLong => "too_long",
             Problem::ContainsSource => "contains_source",
             Problem::Misaligned => "misaligned",
+            Problem::Rejected => "rejected",
         }
     }
 }

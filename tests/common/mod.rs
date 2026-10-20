@@ -33,6 +33,8 @@ pub enum LlmMode {
     Truncated,
     /// Answer correctly after a delay.
     Slow(u64),
+    /// 400 "invalid parameter" (a configuration problem).
+    ConfigError,
 }
 
 #[derive(Default)]
@@ -118,6 +120,17 @@ async fn mock_llm(State(st): State<Arc<MockState>>, body: Bytes) -> Response {
         if s.is_empty() { LlmMode::Good } else { s.remove(0) }
     };
     let req: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    // Behave like Zhipu GLM: temperature may have at most two decimals.
+    if let Some(t) = req.get("temperature") {
+        let txt = t.to_string();
+        if txt.split('.').nth(1).is_some_and(|d| d.len() > 2) {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({"error": {"code": "1210", "message": format!("temperature参数非法：限制小数点[2]位 ({txt})")}}).to_string(),
+            )
+                .into_response();
+        }
+    }
     let user = req["messages"][1]["content"].as_str().unwrap_or("").to_string();
     let re = regex::Regex::new(r#"(?s)<seg id="(\d+)">(.*?)</seg>"#).unwrap();
     let segs: Vec<(String, String)> = re.captures_iter(&user).map(|c| (c[1].to_string(), c[2].to_string())).collect();
@@ -128,6 +141,9 @@ async fn mock_llm(State(st): State<Arc<MockState>>, body: Bytes) -> Response {
             return (StatusCode::from_u16(code).unwrap(), json!({"error": {"message": "mock failure"}}).to_string()).into_response();
         }
         LlmMode::Garbage => ("Sorry, I can't help with that.".to_string(), "stop"),
+        LlmMode::ConfigError => {
+            return (StatusCode::BAD_REQUEST, json!({"error": {"code": "1214", "message": "model参数非法"}}).to_string()).into_response();
+        }
         LlmMode::Untranslated => (answer(&|t| t.to_string()), "stop"),
         LlmMode::Truncated => {
             let full = answer(&pseudo_translate);
@@ -406,10 +422,8 @@ pub fn png(w: u32, h: u32) -> Vec<u8> {
     }
     let mut raw = Vec::new();
     for _ in 0..h {
-        raw.push(0u8);
-        for _ in 0..w {
-            raw.extend([200u8, 30, 30]);
-        }
+        raw.push(0u8); // filter type: none
+        raw.extend([200u8, 30, 30].repeat(w as usize));
     }
     let mut z = vec![0x78, 0x01];
     for (i, block) in raw.chunks(65535).enumerate() {

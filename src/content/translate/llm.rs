@@ -62,13 +62,117 @@ impl ApiError {
     pub fn is_auth(&self) -> bool {
         matches!(self, ApiError::Http { status: 401 | 403, .. }) || self.is_quota()
     }
+
+    fn body_lower(&self) -> Option<String> {
+        match self {
+            ApiError::Http { body, .. } => Some(body.to_lowercase()),
+            _ => None,
+        }
+    }
+
+    /// A parameter-validation message ("temperature参数非法", "invalid parameter"):
+    /// a configuration problem even when it mentions lengths or tokens.
+    fn is_param_error(&self) -> bool {
+        let b = self.body_lower().unwrap_or_default();
+        ["参数非法", "参数有误", "参数错误", "invalid parameter", "invalid_parameter", "unknown parameter", "unrecognized request argument", "extra inputs are not permitted"]
+            .iter()
+            .any(|k| b.contains(k))
+    }
+
+    /// The request was too large for the model (split the batch and retry).
+    pub fn is_context_length(&self) -> bool {
+        match self {
+            ApiError::Http { status: 413, .. } => true,
+            ApiError::Http { status: 400 | 422, .. } if !self.is_param_error() => {
+                let b = self.body_lower().unwrap_or_default();
+                [
+                    "context_length_exceeded",
+                    "context length",
+                    "context window",
+                    "too long",
+                    "too many tokens",
+                    "token limit",
+                    "prompt is too",
+                    "input length",
+                    "maximum length",
+                    "exceeds the maximum",
+                    "超长",
+                    "过长",
+                    "超过最大",
+                    "上下文",
+                ]
+                .iter()
+                .any(|k| b.contains(k))
+            }
+            _ => false,
+        }
+    }
+
+    /// The provider refused this content (moderation): isolate the offending segment.
+    pub fn is_content_filter(&self) -> bool {
+        match self {
+            ApiError::Http { status: 400 | 422 | 451, .. } if !self.is_param_error() => {
+                let b = self.body_lower().unwrap_or_default();
+                [
+                    "content_filter",
+                    "contentfilter",
+                    "content filter",
+                    "content_policy",
+                    "content policy",
+                    "content management policy",
+                    "datainspectionfailed",
+                    "data_inspection_failed",
+                    "inappropriate content",
+                    "sensitive content",
+                    "sensitive words",
+                    "moderation",
+                    "safety system",
+                    "\"1301\"",
+                    "敏感",
+                    "审核",
+                    "不安全",
+                    "违规",
+                ]
+                .iter()
+                .any(|k| b.contains(k))
+            }
+            _ => false,
+        }
+    }
+
+    /// What the operator should check, for errors that pause translation.
+    pub fn hint(&self) -> Option<&'static str> {
+        if self.is_quota() {
+            Some("额度不足或账户欠费：请检查服务商账户余额。")
+        } else if self.is_auth() {
+            Some("API Key 无效或无权使用该模型：请检查 Key 与模型名称。")
+        } else if self.is_config() {
+            Some("接口拒绝了请求：请检查 API 地址、模型名称、Temperature、max_tokens 与附加请求参数。")
+        } else if matches!(self, ApiError::Http { status: 429, .. }) {
+            Some("请求过于频繁：可降低最大并发或设置每分钟请求上限。")
+        } else {
+            None
+        }
+    }
+
+    /// The request itself is invalid for this provider (bad parameter, unknown model,
+    /// wrong endpoint): every request will fail until the configuration is fixed.
+    pub fn is_config(&self) -> bool {
+        matches!(self, ApiError::Http { status: 400 | 404 | 405 | 415 | 422, .. }) && !self.is_context_length() && !self.is_content_filter()
+    }
+
     /// Errors that indicate the provider is unhealthy (count toward the circuit breaker).
     pub fn is_provider_failure(&self) -> bool {
         match self {
-            ApiError::Http { status, .. } => matches!(status, 401 | 402 | 403 | 404 | 408 | 429 | 500..=599),
+            ApiError::Http { status, .. } => matches!(status, 408 | 429 | 500..=599) || self.is_auth() || self.is_config(),
             ApiError::Network(_) | ApiError::Timeout => true,
             ApiError::BadResponse(_) => false,
         }
+    }
+
+    /// Errors that need a configuration change: open the circuit right away.
+    pub fn needs_operator(&self) -> bool {
+        self.is_auth() || self.is_config()
     }
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -92,6 +196,11 @@ pub struct OpenAiCompat {
     pub model: String,
     pub timeout: Duration,
     pub extra_body: Option<Value>,
+}
+
+/// Temperature rounded to two decimals as f64.
+pub fn round_temperature(t: f32) -> f64 {
+    ((t as f64) * 100.0).round() / 100.0
 }
 
 /// Build the chat-completions endpoint from a configured base URL.
@@ -130,7 +239,9 @@ impl ChatBackend for OpenAiCompat {
                 "stream": false,
             });
             if let Some(t) = req.temperature {
-                body["temperature"] = json!(t);
+                // f32 -> JSON would yield 0.20000000298023224, which providers such as
+                // Zhipu GLM reject ("限制小数点[2]位"); send a 2-decimal f64.
+                body["temperature"] = json!(round_temperature(t));
             }
             if let Some(m) = req.max_tokens {
                 body["max_tokens"] = json!(m);
@@ -330,6 +441,38 @@ mod tests {
         assert_eq!(b, vec![(5, "multi\nline".to_string())]);
         assert!(parse_any("nothing").is_none());
         assert!(parse_any(r#"{"translations":[{"id":1,"text":"x"}]}"#).is_some());
+    }
+
+    #[test]
+    fn temperature_has_two_decimals() {
+        assert_eq!(serde_json::json!(round_temperature(0.2)).to_string(), "0.2");
+        assert_eq!(serde_json::json!(round_temperature(0.2 + 0.1)).to_string(), "0.3");
+        assert_eq!(serde_json::json!(round_temperature(0.95)).to_string(), "0.95");
+        assert_eq!(serde_json::json!(round_temperature(1.0)).to_string(), "1.0");
+    }
+
+    #[test]
+    fn classifies_400_errors() {
+        let glm = ApiError::Http { status: 400, body: r#"{"error":{"code":"1210","message":"temperature参数非法：限制小数点[2]位"}}"#.into(), retry_after: None };
+        assert!(glm.is_config() && glm.needs_operator() && !glm.is_transient() && !glm.is_context_length());
+        let ctx = ApiError::Http { status: 400, body: "This model's maximum context length is 8192 tokens".into(), retry_after: None };
+        assert!(ctx.is_context_length() && !ctx.is_config());
+        let filt = ApiError::Http { status: 400, body: r#"{"error":{"code":"1301","message":"系统检测到输入或生成内容可能包含不安全或敏感内容"}}"#.into(), retry_after: None };
+        assert!(filt.is_content_filter() && !filt.is_config());
+        let model = ApiError::Http { status: 404, body: "model not found".into(), retry_after: None };
+        assert!(model.is_config());
+        let busy = ApiError::Http { status: 503, body: "overloaded".into(), retry_after: None };
+        assert!(busy.is_transient() && !busy.needs_operator());
+        assert!(glm.hint().is_some_and(|h| h.contains("Temperature")) && busy.hint().is_none());
+        // Parameter errors that mention tokens/lengths are still configuration errors.
+        let mt = ApiError::Http { status: 400, body: r#"{"error":{"code":"1210","message":"max_tokens参数非法"}}"#.into(), retry_after: None };
+        assert!(mt.is_config() && !mt.is_context_length());
+        let cs = ApiError::Http { status: 400, body: "The model name is case-sensitive: GLM-4-Flash not found".into(), retry_after: None };
+        assert!(cs.is_config() && !cs.is_content_filter());
+        for body in ["Your request exceeded model token limit: 8192", "Range of input length should be [1, 30720]", r#"{"error":{"code":"context_length_exceeded"}}"#] {
+            let e = ApiError::Http { status: 400, body: body.into(), retry_after: None };
+            assert!(e.is_context_length() && !e.is_config(), "{body}");
+        }
     }
 
     #[test]

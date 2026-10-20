@@ -72,22 +72,51 @@ async fn transient_failures_are_retried() {
 
 #[tokio::test]
 async fn persistent_failure_publishes_original_with_note() {
+    // Translation enabled but no service configured: after max attempts the original
+    // is published with a note.
+    let mock = start_mock().await;
+    let t = start_app(|s| {
+        tr_settings(&mock)(s);
+        s.translation.base_url = String::new();
+        s.translation.max_attempts = 2;
+    })
+    .await;
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    for _ in 0..100 {
+        if t.count("SELECT COUNT(*) FROM items").await > 0 {
+            break;
+        }
+        t.app.db.call(|c| Ok(c.execute("UPDATE revisions SET next_attempt_at = 0 WHERE state = 'pending'", [])?)).await.unwrap();
+        t.app.wake_pipeline.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 1, "published after giving up");
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(content.contains("prime minister"), "original text kept");
+    let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
+    assert!(notes.contains("翻译失败") && notes.contains("未配置"), "{notes}");
+    assert_eq!(mock.llm_calls(), 0);
+}
+
+#[tokio::test]
+async fn unusable_output_publishes_partial_translation_with_note() {
     let mock = start_mock().await;
     let t = start_app(|s| {
         tr_settings(&mock)(s);
         s.translation.max_attempts = 2;
     })
     .await;
-    mock.script_llm(vec![LlmMode::Http(400); 200]);
+    mock.script_llm(vec![LlmMode::Garbage; 1000]);
     mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
     let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
     t.fetch(fid).await;
     t.wait_idle().await;
-    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 1, "published after giving up");
-    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
-    assert!(content.contains("prime minister"), "original text kept");
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 1);
     let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
-    assert!(notes.contains("翻译失败"), "{notes}");
+    assert!(notes.contains("翻译不完整"), "{notes}");
+    assert!(t.app.translator.circuit_open_for().is_none(), "bad output does not pause the service");
 }
 
 #[tokio::test]
@@ -191,4 +220,33 @@ async fn opencc_then_translation_order_and_title() {
     let (title, content): (String, String) = t.query("SELECT title, content FROM items", |r| Ok((r.get(0)?, r.get(1)?))).await;
     assert_eq!(title, "法国骚乱：巴黎局部宵禁");
     assert!(content.contains("法国多地上周末爆发骚乱及抢掠"), "{content}");
+}
+
+#[tokio::test]
+async fn invalid_parameter_errors_pause_instead_of_retry_storm() {
+    let mock = start_mock().await;
+    let t = start_app(tr_settings(&mock)).await;
+    mock.script_llm(vec![LlmMode::ConfigError; 1000]);
+    let entries: Vec<Entry> = (0..3).map(|i| entry(&format!("c{i}"), &format!("Story {i}"), &format!("https://news.example.com/c{i}"), ARTICLE)).collect();
+    mock.set("/cfg.xml", "application/rss+xml", rss("Cfg", &entries));
+    let fid = t.add_feed(&mock.url("/cfg.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if t.app.translator.circuit_open_for().is_some() {
+            break;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(t.app.translator.circuit_open_for().is_some(), "an invalid-parameter error pauses translation");
+    assert!(mock.llm_calls() <= 4, "no retry storm: {} calls", mock.llm_calls());
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 0, "articles wait for a working configuration");
+    // Configuration fixed (saving settings resets the circuit): everything gets translated.
+    mock.script_llm(vec![]);
+    t.app.translator.reset_circuit();
+    t.app.db.call(|c| Ok(c.execute("UPDATE revisions SET next_attempt_at = 0", [])?)).await.unwrap();
+    t.wait_idle().await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 3);
+    let content: String = t.query("SELECT content FROM items LIMIT 1", |r| r.get(0)).await;
+    assert!(!content.contains("prime minister"));
 }
