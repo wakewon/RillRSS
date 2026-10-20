@@ -13,10 +13,12 @@
 //! its star/labels/note move to the new item.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use futures::FutureExt;
 use rusqlite::{OptionalExtension, Transaction, params};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -40,6 +42,17 @@ pub static RETRY_UNIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// Dispatcher polling interval in milliseconds (tests lower it).
 pub static DISPATCH_TICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3000);
 
+/// Unexpected errors (or panics) in one stage before the revision is given up as 'failed'.
+const MAX_STAGE_ERRORS: i64 = 5;
+/// Runs of one stage that may start without recording an outcome (the process crashed or
+/// was killed mid-stage) before the revision is given up instead of crashing it again.
+const MAX_UNFINISHED_RUNS: i64 = 3;
+/// Extraction attempts for an entry update: the page is the only way to confirm it, and
+/// article pages are often briefly unavailable while being edited (≈ 4 h of back-off).
+const UPDATE_PAGE_ATTEMPTS: i64 = 7;
+/// Stories queued per transaction by a bulk reprocess.
+const REPROCESS_CHUNK: usize = 200;
+
 #[derive(Debug, Clone)]
 pub struct Rev {
     pub id: i64,
@@ -61,13 +74,17 @@ pub struct Rev {
     pub notes: Vec<String>,
     pub attempts: i64,
     pub created_at: i64,
+    /// The text was extracted from the article page.
+    pub from_page: bool,
+    /// Runs of the current stage that started without recording an outcome (incl. this one).
+    pub unfinished: i64,
 }
 
 fn load_rev(conn: &rusqlite::Connection, id: i64) -> Result<Option<Rev>> {
     Ok(conn
         .query_row(
             "SELECT id, story_id, feed_id, reason, stage, guid, title, link, author, published_at, entry_html, media,
-                    content_html, title_out, source_text, lang, notes, attempts, created_at
+                    content_html, title_out, source_text, lang, notes, attempts, created_at, from_page, unfinished
              FROM revisions WHERE id = ? AND state = 'pending'",
             [id],
             |r| {
@@ -91,6 +108,8 @@ fn load_rev(conn: &rusqlite::Connection, id: i64) -> Result<Option<Rev>> {
                     notes: serde_json::from_str(&r.get::<_, String>(16)?).unwrap_or_default(),
                     attempts: r.get(17)?,
                     created_at: r.get(18)?,
+                    from_page: r.get::<_, i64>(19)? != 0,
+                    unfinished: r.get(20)?,
                 })
             },
         )
@@ -120,6 +139,8 @@ struct Advance {
     source_text: Option<String>,
     lang: Option<String>,
     notes: Vec<String>,
+    /// Set when the text now comes from the article page.
+    from_page: Option<bool>,
 }
 
 fn next_after_transform(o: &FeedOptions) -> &'static str {
@@ -216,8 +237,10 @@ async fn claim(app: &AppRef, stage: &'static str, n: usize) -> Result<Vec<i64>> 
     let lease = now + lease_secs(stage);
     app.db
         .call(move |c| {
+            // `unfinished` is counted before the stage runs: a revision that crashes the
+            // process is not retried forever (startup clears the leases).
             let mut st = c.prepare_cached(
-                "UPDATE revisions SET lease_until = ?1 WHERE id IN (
+                "UPDATE revisions SET lease_until = ?1, unfinished = unfinished + 1 WHERE id IN (
                     SELECT id FROM revisions
                     WHERE state = 'pending' AND stage = ?2 AND next_attempt_at <= ?3
                       AND (lease_until IS NULL OR lease_until < ?3)
@@ -240,9 +263,12 @@ fn heartbeat(app: &AppRef, id: i64, stage: &'static str) -> CancellationToken {
             tokio::select! {
                 _ = t2.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    // Only while this stage still holds the lease: a late renewal must not
+                    // lease the revision again after its outcome was recorded.
                     let lease = util::now() + lease_secs(stage);
                     let _ = app.db.call(move |c| Ok(c.execute(
-                        "UPDATE revisions SET lease_until = ? WHERE id = ? AND state = 'pending'", params![lease, id])?)).await;
+                        "UPDATE revisions SET lease_until = ? WHERE id = ? AND state = 'pending' AND stage = ? AND lease_until IS NOT NULL",
+                        params![lease, id, stage])?)).await;
                 }
             }
         }
@@ -251,16 +277,44 @@ fn heartbeat(app: &AppRef, id: i64, stage: &'static str) -> CancellationToken {
 }
 
 async fn run_stage(app: AppRef, id: i64, stage: &'static str, _permit: OwnedSemaphorePermit) {
-    let hb = heartbeat(&app, id, stage);
-    let outcome = match process_stage(&app, id, stage).await {
-        Ok(o) => o,
-        Err(e) => Outcome::Retry { delay: Duration::from_secs(120), error: format!("{e:#}"), count_attempt: true },
+    // Dropping the guard stops the heartbeat, also when this task unwinds.
+    let hb = heartbeat(&app, id, stage).drop_guard();
+    let outcome = match AssertUnwindSafe(process_stage(&app, id, stage)).catch_unwind().await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => stage_error(&app, id, stage, format!("{e:#}")).await,
+        Err(panic) => {
+            let msg = panic_message(panic.as_ref());
+            tracing::error!(revision = id, stage, "stage panicked: {msg}");
+            stage_error(&app, id, stage, format!("处理时发生内部错误：{msg}")).await
+        }
     };
-    hb.cancel();
+    drop(hb);
     if let Err(e) = apply_outcome(&app, id, stage, outcome).await {
         tracing::error!(revision = id, stage, "failed to record stage outcome: {e:#}");
     }
     app.wake_pipeline.notify_one();
+}
+
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into())
+}
+
+/// Outcome for an unexpected error: retry with back-off, but a stage that keeps failing
+/// ends 'failed' instead of retrying forever.
+async fn stage_error(app: &AppRef, id: i64, stage: &'static str, error: String) -> Outcome {
+    let attempts = app
+        .db
+        .call(move |c| {
+            Ok(c.query_row("SELECT attempts FROM revisions WHERE id = ? AND state = 'pending' AND stage = ?", params![id, stage], |r| r.get::<_, i64>(0))
+                .optional()?)
+        })
+        .await;
+    match attempts {
+        Ok(Some(a)) if a + 1 >= MAX_STAGE_ERRORS => Outcome::Failed(format!("{error}（已尝试 {} 次）", a + 1)),
+        Ok(Some(a)) => Outcome::Retry { delay: retry_backoff(a), error, count_attempt: true },
+        Ok(None) => Outcome::Gone,
+        Err(_) => Outcome::Retry { delay: retry_backoff(0), error, count_attempt: true },
+    }
 }
 
 async fn process_stage(app: &AppRef, id: i64, stage: &'static str) -> Result<Outcome> {
@@ -269,6 +323,9 @@ async fn process_stage(app: &AppRef, id: i64, stage: &'static str) -> Result<Out
     };
     if rev.stage != stage {
         return Ok(Outcome::Gone);
+    }
+    if rev.unfinished > MAX_UNFINISHED_RUNS {
+        return Ok(Outcome::Failed(format!("此阶段已有 {} 次处理未能完成（进程中断或崩溃），已放弃", rev.unfinished - 1)));
     }
     let feed_id = rev.feed_id;
     let Some(feed) = app.db.call(move |c| load_feed(c, feed_id)).await? else {
@@ -290,7 +347,7 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
     match outcome {
         Outcome::Gone => {
             app.db
-                .call(move |c| Ok(c.execute("UPDATE revisions SET lease_until = NULL WHERE id = ? AND stage = ?", params![id, stage])?))
+                .call(move |c| Ok(c.execute("UPDATE revisions SET lease_until = NULL, unfinished = 0 WHERE id = ? AND stage = ?", params![id, stage])?))
                 .await?;
         }
         Outcome::Advance(a) => {
@@ -304,10 +361,23 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
                     all.extend(notes);
                     c.execute(
                         "UPDATE revisions SET stage = ?, content_html = COALESCE(?, content_html), title_out = COALESCE(?, title_out),
-                             source_text = COALESCE(?, source_text), lang = COALESCE(?, lang), media = COALESCE(?, media), notes = ?, attempts = 0,
+                             source_text = COALESCE(?, source_text), lang = COALESCE(?, lang), media = COALESCE(?, media),
+                             from_page = COALESCE(?, from_page), notes = ?, attempts = 0, unfinished = 0,
                              next_attempt_at = 0, lease_until = NULL, last_error = NULL, updated_at = ?
                          WHERE id = ? AND state = 'pending' AND stage = ?",
-                        params![a.next, a.content_html, a.title_out, a.source_text, a.lang, a.media, serde_json::to_string(&all)?, now, id, stage],
+                        params![
+                            a.next,
+                            a.content_html,
+                            a.title_out,
+                            a.source_text,
+                            a.lang,
+                            a.media,
+                            a.from_page.map(|b| b as i64),
+                            serde_json::to_string(&all)?,
+                            now,
+                            id,
+                            stage
+                        ],
                     )?;
                     Ok(())
                 })
@@ -321,7 +391,7 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
                 .call(move |c| {
                     c.execute(
                         "UPDATE revisions SET attempts = attempts + ?, total_attempts = total_attempts + 1, next_attempt_at = ?,
-                             lease_until = NULL, last_error = ?, updated_at = ?
+                             lease_until = NULL, unfinished = 0, last_error = ?, updated_at = ?
                          WHERE id = ? AND state = 'pending' AND stage = ?",
                         params![inc, next, util::truncate_chars(&error_msg, 1000), now, id, stage],
                     )?;
@@ -337,9 +407,9 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
                 .call(move |c| {
                     let s = c.query_row("SELECT feed_id, story_id FROM revisions WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
                     c.execute(
-                        "UPDATE revisions SET state = 'unchanged', stage = 'done', lease_until = NULL, content_html = NULL,
-                             last_error = ?, updated_at = ? WHERE id = ? AND state = 'pending'",
-                        params![why2, now, id],
+                        "UPDATE revisions SET state = 'unchanged', stage = 'done', lease_until = NULL, unfinished = 0, content_html = NULL,
+                             last_error = ?, updated_at = ? WHERE id = ? AND state = 'pending' AND stage = ?",
+                        params![why2, now, id, stage],
                     )?;
                     Ok(s)
                 })
@@ -355,8 +425,9 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
                 .call(move |c| {
                     let s = c.query_row("SELECT feed_id, story_id FROM revisions WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
                     c.execute(
-                        "UPDATE revisions SET state = 'failed', lease_until = NULL, last_error = ?, updated_at = ? WHERE id = ? AND state = 'pending'",
-                        params![why2, now, id],
+                        "UPDATE revisions SET state = 'failed', lease_until = NULL, unfinished = 0, last_error = ?, updated_at = ?
+                         WHERE id = ? AND state = 'pending' AND stage = ?",
+                        params![why2, now, id, stage],
                     )?;
                     Ok(s)
                 })
@@ -442,53 +513,127 @@ fn text_len(html: &str) -> usize {
     text::html_to_text(html).chars().filter(|c| !c.is_whitespace()).count()
 }
 
+/// Why the article page could not be used.
+enum PageProblem {
+    Fetch(String),
+    TooShort(usize),
+}
+
+impl PageProblem {
+    fn describe(&self) -> String {
+        match self {
+            PageProblem::Fetch(e) => e.clone(),
+            PageProblem::TooShort(got) => format!("提取的正文过短（{got} 字）"),
+        }
+    }
+}
+
+/// Was a reprocess of this story queued after its last publish and then replaced by this
+/// newer revision (ingest replaces pending revisions)? Then this one still owes it.
+async fn replaced_reprocess(app: &AppRef, rev: &Rev) -> Result<bool> {
+    let (sid, id) = (rev.story_id, rev.id);
+    app.db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM revisions WHERE story_id = ?1 AND reason = 'reprocess' AND state = 'obsolete' AND id < ?2
+                     AND id > COALESCE((SELECT MAX(id) FROM revisions WHERE story_id = ?1 AND state = 'published'), 0))",
+                params![sid, id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+}
+
+/// Turn a pending revision into a reprocess (published without the update marks).
+async fn make_reprocess(app: &AppRef, id: i64) -> Result<()> {
+    app.db.call(move |c| Ok(c.execute("UPDATE revisions SET reason = 'reprocess' WHERE id = ? AND state = 'pending'", [id])?)).await?;
+    Ok(())
+}
+
+/// The story's current version (and its change-detection baseline) came from the page.
+async fn story_from_page(app: &AppRef, story_id: i64) -> Result<bool> {
+    app.db
+        .call(move |c| Ok(c.query_row("SELECT from_page FROM stories WHERE id = ?", [story_id], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0) != 0))
+        .await
+}
+
+/// The page could not be used. A new article falls back to the feed content; an update
+/// can only be confirmed on the page (retry for a few hours, then drop it); a reprocess
+/// never replaces a version that came from the page with the feed content.
+async fn page_problem(app: &AppRef, rev: &Rev, problem: PageProblem) -> Result<Outcome> {
+    let why = problem.describe();
+    let ev = EventRef::story(rev.feed_id, rev.story_id);
+    let mut reprocess = rev.reason == "reprocess";
+    if rev.reason == "entry_update" {
+        if rev.attempts + 1 < UPDATE_PAGE_ATTEMPTS {
+            return Ok(Outcome::Retry { delay: retry_backoff(rev.attempts), error: format!("原文无法获取，稍后重试：{why}"), count_attempt: true });
+        }
+        if !replaced_reprocess(app, rev).await? {
+            app.event(Level::Warn, "extract", ev, format!("原文无法获取，无法确认更新：{why}")).await;
+            return Ok(Outcome::Unchanged(format!("原文无法获取：{why}")));
+        }
+        make_reprocess(app, rev.id).await?;
+        reprocess = true;
+    }
+    if reprocess && story_from_page(app, rev.story_id).await? {
+        app.event(Level::Warn, "extract", ev, format!("原文页面无法获取，保留当前版本：{why}")).await;
+        return Ok(Outcome::Unchanged(format!("原文页面无法获取，保留当前版本：{why}")));
+    }
+    let note = match &problem {
+        PageProblem::Fetch(e) => {
+            app.event(Level::Warn, "extract", ev, format!("全文提取失败，改用订阅内容：{e}")).await;
+            format!("全文提取失败：{e}")
+        }
+        PageProblem::TooShort(_) => format!("{why}，改用订阅内容"),
+    };
+    Ok(Outcome::Advance(Advance { next: "transform", notes: vec![note], ..Default::default() }))
+}
+
 async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &Rev) -> Result<Outcome> {
     let Some(link) = rev.link.clone() else {
         return Ok(Outcome::Advance(Advance { next: "transform", notes: vec!["全文提取：没有原文链接".into()], ..Default::default() }));
     };
     let entry_html = rev.entry_html.clone().unwrap_or_default();
-    let fallback = |note: String| {
-        Outcome::Advance(Advance { next: "transform", notes: vec![note], ..Default::default() })
-    };
     let extracted = match extract_page(app, settings, feed, &link).await {
         Ok(p) => p,
-        Err(PageError::Transient(e)) if rev.attempts < 3 => {
+        Err(PageError::Transient(e)) if rev.attempts < 3 && rev.reason != "entry_update" => {
             return Ok(Outcome::Retry { delay: retry_backoff(rev.attempts), error: format!("全文提取：{e}"), count_attempt: true });
         }
-        Err(PageError::Transient(e)) | Err(PageError::Permanent(e)) => {
-            app.event(Level::Warn, "extract", EventRef::story(rev.feed_id, rev.story_id), format!("全文提取失败，改用订阅内容：{e}"))
-                .await;
-            if rev.reason == "entry_update" {
-                // Can't confirm the update without the page.
-                return Ok(Outcome::Unchanged(format!("原文无法获取：{e}")));
-            }
-            return Ok(fallback(format!("全文提取失败：{e}")));
-        }
+        Err(PageError::Transient(e)) | Err(PageError::Permanent(e)) => return page_problem(app, rev, PageProblem::Fetch(e)).await,
     };
     let html = extract::apply_remove(&extracted.html, &feed.options.remove_selector);
     let got = text_len(&html);
     let entry_len = text_len(&entry_html);
     let min = settings.fulltext.min_text_chars as usize;
     if got < min.min(entry_len.max(1) * 3) || (entry_len > 300 && got * 2 < entry_len) {
-        if rev.reason == "entry_update" {
-            return Ok(Outcome::Unchanged("提取的正文过短".into()));
-        }
-        return Ok(fallback(format!("提取的正文过短（{got} 字），改用订阅内容")));
+        return page_problem(app, rev, PageProblem::TooShort(got)).await;
     }
     let src = ingest::source_text(&html);
     // Confirm that an entry update really changed the article.
     if rev.reason == "entry_update" {
-        let (old_title, old_text): (Option<String>, Option<String>) = {
+        let (old_title, old_text, from_page): (Option<String>, Option<String>, bool) = {
             let sid = rev.story_id;
             app.db
-                .call(move |c| Ok(c.query_row("SELECT source_title, source_text FROM stories WHERE id = ?", [sid], |r| Ok((r.get(0)?, r.get(1)?)))?))
+                .call(move |c| {
+                    Ok(c.query_row("SELECT source_title, source_text, from_page FROM stories WHERE id = ?", [sid], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0))
+                    })?)
+                })
                 .await?
         };
-        let a = assess_change(old_title.as_deref().unwrap_or(""), old_text.as_deref().unwrap_or(""), &rev.title, &src, &settings.updates);
-        if !a.substantive {
+        // Compare like with like: a current version that came from the feed entry
+        // (extraction failed back then, or full text was enabled later) has the entry text
+        // as baseline, so the new entry is what is compared — not the page.
+        let new_text = if from_page { src.clone() } else { ingest::feed_text(&entry_html, &feed.options) };
+        let a = assess_change(old_title.as_deref().unwrap_or(""), old_text.as_deref().unwrap_or(""), &rev.title, &new_text, &settings.updates);
+        if a.substantive {
+            app.event(Level::Info, "update", EventRef::story(rev.feed_id, rev.story_id), format!("确认实质更新：{}", a.summary)).await;
+        } else if replaced_reprocess(app, rev).await? {
+            // Not news, but it took the place of a queued reprocess: publish as that.
+            make_reprocess(app, rev.id).await?;
+        } else {
             return Ok(Outcome::Unchanged(format!("原文没有实质修改：{}", a.summary)));
         }
-        app.event(Level::Info, "update", EventRef::story(rev.feed_id, rev.story_id), format!("确认实质更新：{}", a.summary)).await;
     }
     // Prefer the page's own lead image (usually high resolution) over the feed thumbnail.
     let media = match extracted.image.as_deref().map(str::trim).filter(|i| i.starts_with("http")) {
@@ -505,6 +650,7 @@ async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
         content_html: Some(html),
         source_text: Some(src),
         lang: extracted.lang,
+        from_page: Some(true),
         ..Default::default()
     }))
 }
@@ -569,16 +715,23 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
     let title_in = if opts.translate_title { Some(title.as_str()) } else { None };
     let ev = EventRef::story(rev.feed_id, rev.story_id);
 
+    // When translation keeps failing (or stays incomplete): "hold" waits up to 72 h;
+    // otherwise the original is published — but a reprocess never replaces the current
+    // version with an untranslated or partly translated one.
+    let hold = ts.on_failure == "hold" && util::now() - rev.created_at < 72 * 3600;
+    let reprocess = rev.reason == "reprocess";
     let give_up = |why: String| -> Outcome {
-        if ts.on_failure == "hold" && util::now() - rev.created_at < 72 * 3600 {
+        if hold {
             Outcome::Retry { delay: Duration::from_secs(6 * 3600), error: why, count_attempt: false }
+        } else if reprocess {
+            Outcome::Failed(format!("翻译失败，保留当前版本：{why}"))
         } else {
             Outcome::Advance(Advance { next, notes: vec![format!("翻译失败，已发布原文：{why}")], ..Default::default() })
         }
     };
 
     match app.translator.translate_article(ts, &opts.target_lang, title_in, &html, bilingual).await {
-        Ok(t) if t.complete || last_attempt => {
+        Ok(t) if t.complete || (last_attempt && !hold && !reprocess) => {
             let mut notes = Vec::new();
             if t.skipped_same_language {
                 notes.push("跳过翻译：已是目标语言".to_string());
@@ -598,11 +751,13 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
                 ..Default::default()
             }))
         }
-        Ok(t) => Ok(Outcome::Retry {
-            delay: retry_backoff(rev.attempts),
-            error: format!("翻译不完整（{} / {} 段失败：{}）", t.failed_segments, t.total_segments, t.problems.join(", ")),
-            count_attempt: true,
-        }),
+        Ok(t) => {
+            let why = format!("翻译不完整（{} / {} 段失败：{}）", t.failed_segments, t.total_segments, t.problems.join(", "));
+            if last_attempt {
+                return Ok(give_up(why));
+            }
+            Ok(Outcome::Retry { delay: retry_backoff(rev.attempts), error: why, count_attempt: true })
+        }
         Err(TranslateError::CircuitOpen(d)) => Ok(Outcome::Retry {
             delay: d.max(Duration::from_millis(30 * RETRY_UNIT_MS.load(std::sync::atomic::Ordering::Relaxed))),
             error: "翻译服务暂停中（熔断）".into(),
@@ -676,9 +831,11 @@ pub fn next_page_check(settings: &Settings, opts: &FeedOptions, first_seen_at: i
 
 struct PublishInfo {
     item_id: i64,
+    /// Version number as news (see `stories.news_versions`).
     version: i64,
     title: String,
     previous: Option<i64>,
+    reprocess: bool,
 }
 
 fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) -> Result<Option<PublishInfo>> {
@@ -698,31 +855,47 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
         tx.execute("UPDATE revisions SET state = 'obsolete', stage = 'done', lease_until = NULL WHERE id = ?", [rev.id])?;
         return Ok(None);
     }
-    let (version, current_item, first_seen_at, check_count): (i64, Option<i64>, i64, i64) = tx.query_row(
-        "SELECT version, current_item_id, first_seen_at, check_count FROM stories WHERE id = ?",
+    #[allow(clippy::type_complexity)]
+    let (version, news_versions, current_item, first_seen_at, check_count): (i64, i64, Option<i64>, i64, i64) = tx.query_row(
+        "SELECT version, news_versions, current_item_id, first_seen_at, check_count FROM stories WHERE id = ?",
         [rev.story_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     #[allow(clippy::type_complexity)]
-    let old: Option<(i64, i64, i64, i64, Option<String>, i64)> = match current_item {
+    let old: Option<(i64, i64, i64, i64, Option<String>, i64, Option<i64>)> = match current_item {
         Some(iid) => tx
             .query_row(
-                "SELECT id, is_read, is_starred, is_published, note, published_at FROM items WHERE id = ?",
+                "SELECT id, is_read, is_starred, is_published, note, published_at, read_at FROM items WHERE id = ?",
                 [iid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
             .optional()?,
         None => None,
     };
     let now = util::now();
+    let reprocess = rev.reason == "reprocess";
+    if reprocess && current_item.is_some() && old.is_none() {
+        // The version to re-render was deleted (retention) while the reprocess waited:
+        // publishing would bring the article back as a new, unread one.
+        tx.execute(
+            "UPDATE revisions SET state = 'obsolete', stage = 'done', lease_until = NULL, last_error = ?, updated_at = ? WHERE id = ?",
+            params!["当前版本已被清理，取消重新处理", now, rev.id],
+        )?;
+        return Ok(None);
+    }
     // Strictly increasing insertion time (clients use it as a sync cursor); guards
     // against clock steps.
     let last_us: i64 = tx.query_row("SELECT COALESCE(MAX(created_at), 0) FROM items", [], |r| r.get(0))?;
     let now_us = util::now_us().max(last_us + 1);
     let is_update = old.is_some();
-    let real_update = is_update && rev.reason != "reprocess";
+    let real_update = is_update && !reprocess;
     let us = &settings.updates;
     let new_version = version + 1;
+    // A re-rendered version is not news: it counts neither towards max_versions nor in
+    // the version shown in update notices (`version`, the internal counter, still makes
+    // the item guid unique).
+    let counts_as_news = !(reprocess && is_update);
+    let news_version = if counts_as_news { news_versions + 1 } else { news_versions };
 
     let mut title = rev.title_out.clone().unwrap_or_else(|| rev.title.clone());
     if title.trim().is_empty() {
@@ -747,22 +920,31 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
         content = format!(
             "<p><em>🔄 {} · v{} · {}{}</em></p><hr>{content}",
             escape(us.notice_label.trim()),
-            new_version,
+            news_version,
             when,
             if orig.is_empty() { String::new() } else { format!(" · {} {}", escape(us.previous_label.trim()), orig) }
         );
     }
-    let published_at = if real_update && us.redate { now } else { rev.published_at.unwrap_or(now).min(now + 60) };
+    let published_at = if real_update && us.redate {
+        now
+    } else if let Some(o) = old.as_ref().filter(|_| reprocess) {
+        // A reprocess keeps the date of the version it re-renders.
+        o.5
+    } else {
+        rev.published_at.unwrap_or(now).min(now + 60)
+    };
     let excerpt = text::excerpt(&content, 300);
-    let (is_read, is_starred, is_published, note) = match &old {
-        Some((_, r, s, p, n, _)) => (if real_update && us.mark_unread { 0 } else { *r }, *s, *p, n.clone()),
-        None => (0, 0, 0, None),
+    // An inherited read state keeps its read_at (TT-RSS "recently read" lists by it).
+    let (is_read, read_at, is_starred, is_published, note) = match &old {
+        Some((_, _, s, p, n, _, _)) if real_update && us.mark_unread => (0, None, *s, *p, n.clone()),
+        Some((_, r, s, p, n, _, ra)) => (*r, if *r != 0 { ra.or(Some(now)) } else { None }, *s, *p, n.clone()),
+        None => (0, None, 0, 0, None),
     };
     let item_guid = if new_version > 1 { format!("{}#rill-v{}", rev.guid, new_version) } else { rev.guid.clone() };
     tx.execute(
         "INSERT INTO items (feed_id, story_id, revision_id, version, guid, link, title, author, content, excerpt, media, lang,
-             published_at, updated_at, created_at, is_read, is_starred, is_published, note, starred_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             published_at, updated_at, created_at, is_read, read_at, is_starred, is_published, note, starred_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             feed.id,
             rev.story_id,
@@ -780,6 +962,7 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
             now,
             now_us,
             is_read,
+            read_at,
             is_starred,
             is_published,
             note,
@@ -800,7 +983,7 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
         // A reprocess (new settings, not news) of an article that was already read hides
         // the old copy: every client already knows it is read, and lists don't double up.
         let old_was_read = old.as_ref().is_some_and(|o| o.1 != 0);
-        let hide = us.hide_superseded || (rev.reason == "reprocess" && old_was_read);
+        let hide = us.hide_superseded || (reprocess && old_was_read);
         tx.execute(
             "UPDATE items SET superseded_by = ?, hidden = ?, read_at = CASE WHEN is_read = 0 THEN ? ELSE read_at END, is_read = 1 WHERE id = ?",
             params![item_id, hide as i64, now, old_id],
@@ -810,18 +993,22 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
     }
     let next_check = next_page_check(settings, &feed.options, first_seen_at, check_count);
     tx.execute(
-        "UPDATE stories SET version = ?, current_item_id = ?, last_published_at = ?, source_title = ?, source_text = COALESCE(?, source_text),
-             next_check_at = COALESCE(next_check_at, ?), state = CASE WHEN ? > 0 AND ? >= ? THEN 'frozen' ELSE state END
+        "UPDATE stories SET version = ?, news_versions = ?, current_item_id = ?, last_published_at = ?, source_title = ?,
+             source_text = COALESCE(?, source_text), from_page = ?, next_check_at = COALESCE(next_check_at, ?),
+             state = CASE WHEN ? AND ? > 0 AND ? >= ? THEN 'frozen' ELSE state END
          WHERE id = ?",
         params![
             new_version,
+            news_version,
             item_id,
             now,
             rev.title,
             rev.source_text,
+            rev.from_page as i64,
             next_check,
+            counts_as_news,
             us.max_versions,
-            new_version,
+            news_version,
             us.max_versions,
             rev.story_id
         ],
@@ -830,7 +1017,7 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
         "UPDATE revisions SET state = 'published', stage = 'done', item_id = ?, lease_until = NULL, content_html = NULL, source_text = NULL, updated_at = ? WHERE id = ?",
         params![item_id, now, rev.id],
     )?;
-    Ok(Some(PublishInfo { item_id, version: new_version, title, previous }))
+    Ok(Some(PublishInfo { item_id, version: news_version, title, previous, reprocess }))
 }
 
 async fn stage_publish(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &Rev) -> Result<Outcome> {
@@ -844,10 +1031,12 @@ async fn stage_publish(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
             let mut ev = EventRef::story(rev.feed_id, rev.story_id);
             ev.item_id = Some(p.item_id);
             let msg = match p.previous {
+                Some(old) if p.reprocess => format!("重新处理后发布（文章 #{}，取代 #{old}）：{}", p.item_id, util::truncate_chars(&p.title, 120)),
                 Some(old) => format!("发布第 {} 版（文章 #{}，取代 #{old}）：{}", p.version, p.item_id, util::truncate_chars(&p.title, 120)),
                 None => format!("发布文章 #{}：{}", p.item_id, util::truncate_chars(&p.title, 120)),
             };
-            app.event(Level::Info, if p.previous.is_some() { "update" } else { "publish" }, ev, msg).await;
+            let news_update = p.previous.is_some() && !p.reprocess;
+            app.event(Level::Info, if news_update { "update" } else { "publish" }, ev, msg).await;
             Ok(Outcome::Gone)
         }
     }
@@ -906,19 +1095,33 @@ pub async fn check_due_pages(app: &AppRef) -> Result<usize> {
 async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story_id: i64) -> Result<()> {
     let feed = app.db.call(move |c| load_feed(c, feed_id)).await?.ok_or_else(|| anyhow!("feed gone"))?;
     #[allow(clippy::type_complexity)]
-    let story: (Option<String>, String, Option<String>, Option<String>, i64, i64, Option<i64>, i64, i64) = app
+    let story: (Option<String>, String, Option<String>, Option<String>, i64, i64, Option<i64>, i64, i64, bool, i64) = app
         .db
         .call(move |c| {
             Ok(c.query_row(
                 "SELECT link, title, source_title, source_text, version, first_seen_at, last_published_at, check_count,
-                        (SELECT COUNT(*) FROM revisions WHERE story_id = stories.id AND state = 'pending')
+                        (SELECT COUNT(*) FROM revisions WHERE story_id = stories.id AND state = 'pending'), from_page, news_versions
                  FROM stories WHERE id = ?",
                 [story_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get::<_, i64>(9)? != 0,
+                        r.get(10)?,
+                    ))
+                },
             )?)
         })
         .await?;
-    let (link, title, source_title, source_text, version, first_seen_at, last_published_at, check_count, pending) = story;
+    let (link, title, source_title, source_text, version, first_seen_at, last_published_at, check_count, pending, from_page, news_versions) = story;
     let now = util::now();
     let next_check = next_page_check(settings, &feed.options, first_seen_at, check_count + 1);
     let reschedule = |app: &AppRef, next: Option<i64>, inc: i64| {
@@ -932,11 +1135,14 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
                 .await
         }
     };
+    // The baseline must be page text too (not the feed entry of a version whose
+    // extraction failed): comparing the page with it would always look like an update.
     let eligible = version > 0
         && source_text.is_some()
+        && from_page
         && feed.options.updates == UpdateMode::Page
         && feed.options.fulltext != FulltextMode::Off
-        && (settings.updates.max_versions == 0 || version < settings.updates.max_versions as i64);
+        && (settings.updates.max_versions == 0 || news_versions < settings.updates.max_versions as i64);
     let Some(link) = link.filter(|_| eligible) else {
         return reschedule(app, None, 0).await;
     };
@@ -978,8 +1184,8 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
             ingest::obsolete_pending(tx, story_id, now)?;
             tx.execute(
                 "INSERT INTO revisions (story_id, feed_id, reason, state, stage, guid, title, link, author, published_at, entry_html, media,
-                     content_html, source_text, lang, next_attempt_at, created_at, updated_at)
-                 VALUES (?, ?, 'page_update', 'pending', 'transform', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     content_html, source_text, lang, from_page, next_attempt_at, created_at, updated_at)
+                 VALUES (?, ?, 'page_update', 'pending', 'transform', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
                 params![story_id, feed_id, guid, rtitle, rlink, author, published_at, entry_html, media, html, src, lang, not_before.max(0), now, now],
             )?;
             tx.execute("UPDATE stories SET next_check_at = ?, check_count = check_count + 1 WHERE id = ?", params![next_check, story_id])?;
@@ -997,8 +1203,27 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
 // Admin actions
 // ---------------------------------------------------------------------------
 
-/// Insert a 'reprocess' revision for a story from its latest source data.
-fn insert_reprocess(tx: &Transaction, story_id: i64, stage: &str, priority: i64, now: i64) -> Result<bool> {
+/// Result of queueing a reprocess for one story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Queued {
+    Inserted,
+    /// A revision is already pending: it runs with the current settings anyway.
+    Pending,
+    /// No source data to reprocess from.
+    Missing,
+}
+
+/// Insert a 'reprocess' revision for a story from its latest source data. A pending
+/// revision (news update, page update, earlier reprocess) is never replaced — a news
+/// update would be published silently as a reprocess — only hurried up to `priority`.
+fn insert_reprocess(tx: &Transaction, story_id: i64, stage: &str, priority: i64, now: i64) -> Result<Queued> {
+    let pending = tx.execute(
+        "UPDATE revisions SET priority = MAX(priority, ?) WHERE story_id = ? AND state = 'pending'",
+        params![priority, story_id],
+    )?;
+    if pending > 0 {
+        return Ok(Queued::Pending);
+    }
     #[allow(clippy::type_complexity)]
     let latest: Option<(i64, String, String, Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>)> = tx
         .query_row(
@@ -1007,8 +1232,7 @@ fn insert_reprocess(tx: &Transaction, story_id: i64, stage: &str, priority: i64,
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         )
         .optional()?;
-    let Some((feed_id, guid, title, link, author, published_at, entry_html, media)) = latest else { return Ok(false) };
-    ingest::obsolete_pending(tx, story_id, now)?;
+    let Some((feed_id, guid, title, link, author, published_at, entry_html, media)) = latest else { return Ok(Queued::Missing) };
     tx.execute(
         "INSERT INTO revisions (story_id, feed_id, reason, state, stage, priority, guid, title, link, author, published_at, entry_html, media,
              next_attempt_at, created_at, updated_at)
@@ -1016,26 +1240,28 @@ fn insert_reprocess(tx: &Transaction, story_id: i64, stage: &str, priority: i64,
         params![story_id, feed_id, stage, priority, guid, title, link, author, published_at, entry_html, media, now, now],
     )?;
     tx.execute("UPDATE stories SET state = 'active' WHERE id = ? AND state = 'skipped'", [story_id])?;
-    Ok(true)
+    Ok(Queued::Inserted)
 }
 
 /// Re-run processing for a story from its latest source (publishes a new version).
+/// Returns false when there is nothing to reprocess from.
 pub async fn reprocess_story(app: &AppRef, story_id: i64) -> Result<bool> {
     let now = util::now();
     let feed_id: i64 = app.db.call(move |c| Ok(c.query_row("SELECT feed_id FROM stories WHERE id = ?", [story_id], |r| r.get(0))?)).await?;
     let feed = app.db.call(move |c| load_feed(c, feed_id)).await?.ok_or_else(|| anyhow!("feed gone"))?;
     let stage = ingest::initial_stage(&feed.options);
-    let ok = app.db.write(move |tx| insert_reprocess(tx, story_id, stage, 10, now)).await?;
-    if ok {
+    let queued = app.db.write(move |tx| insert_reprocess(tx, story_id, stage, 10, now)).await?;
+    if queued != Queued::Missing {
         app.wake_pipeline.notify_one();
     }
-    Ok(ok)
+    Ok(queued != Queued::Missing)
 }
 
 /// Which published articles a bulk reprocess covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReprocessScope {
-    /// The newest N articles.
+    /// The N most recently seen stories (item ids change with every version, so they
+    /// say nothing about the age of an article).
     Latest(u32),
     /// Articles first seen within the last N days.
     Days(u32),
@@ -1070,15 +1296,18 @@ impl ReprocessScope {
 
 /// Reprocess published articles of one feed (or all feeds) with the current settings.
 /// Each article is re-published as a new version that keeps its read/star state and
-/// date. Runs at low priority so fresh articles are not delayed. Returns the count.
+/// date. Runs at low priority so fresh articles are not delayed. Stories with a pending
+/// revision are left alone (it runs with the current settings; a double click doesn't
+/// re-queue). Queued in short transactions. Returns the count.
 pub async fn reprocess_published(app: &AppRef, feed_id: Option<i64>, scope: ReprocessScope, unread_only: bool) -> Result<usize> {
     let now = util::now();
-    let n = app
+    let rows: Vec<(i64, String)> = app
         .db
-        .write(move |tx| {
+        .call(move |c| {
             let mut sql = String::from(
                 "SELECT s.id, f.options FROM stories s JOIN feeds f ON f.id = s.feed_id JOIN items i ON i.id = s.current_item_id
-                 WHERE s.state <> 'skipped'",
+                 WHERE s.state <> 'skipped'
+                   AND NOT EXISTS (SELECT 1 FROM revisions v WHERE v.story_id = s.id AND v.state = 'pending')",
             );
             let mut p: Vec<rusqlite::types::Value> = Vec::new();
             if let Some(f) = feed_id {
@@ -1092,25 +1321,33 @@ pub async fn reprocess_published(app: &AppRef, feed_id: Option<i64>, scope: Repr
                 sql.push_str(" AND s.first_seen_at >= ?");
                 p.push((now - d as i64 * 86400).into());
             }
-            sql.push_str(" ORDER BY i.id DESC");
+            sql.push_str(" ORDER BY s.first_seen_at DESC, s.id DESC");
             if let ReprocessScope::Latest(n) = scope {
                 sql.push_str(" LIMIT ?");
                 p.push((n as i64).into());
             }
-            let rows: Vec<(i64, String)> = {
-                let mut st = tx.prepare(&sql)?;
-                st.query_map(rusqlite::params_from_iter(p), |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
-            };
-            let mut n = 0;
-            for (story_id, opts) in rows {
-                let stage = ingest::initial_stage(&FeedOptions::from_json(&opts));
-                if insert_reprocess(tx, story_id, stage, -10, now)? {
-                    n += 1;
-                }
-            }
-            Ok(n)
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params_from_iter(p), |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            Ok(rows)
         })
         .await?;
+    let mut n = 0;
+    for chunk in rows.chunks(REPROCESS_CHUNK) {
+        let chunk = chunk.to_vec();
+        n += app
+            .db
+            .write(move |tx| {
+                let mut n = 0;
+                for (story_id, opts) in chunk {
+                    let stage = ingest::initial_stage(&FeedOptions::from_json(&opts));
+                    if insert_reprocess(tx, story_id, stage, -10, now)? == Queued::Inserted {
+                        n += 1;
+                    }
+                }
+                Ok(n)
+            })
+            .await?;
+    }
     if n > 0 {
         app.wake_pipeline.notify_one();
         app.event(
@@ -1132,20 +1369,25 @@ pub async fn retry_failed(app: &AppRef, feed_id: Option<i64>) -> Result<usize> {
         .call(move |c| {
             let n = match feed_id {
                 Some(f) => c.execute(
-                    "UPDATE revisions SET state = 'pending', attempts = 0, next_attempt_at = 0, lease_until = NULL, updated_at = ?
+                    "UPDATE revisions SET state = 'pending', attempts = 0, unfinished = 0, next_attempt_at = 0, lease_until = NULL, updated_at = ?
                      WHERE state = 'failed' AND feed_id = ? AND id = (SELECT MAX(id) FROM revisions r2 WHERE r2.story_id = revisions.story_id)",
                     params![now, f],
                 )?,
                 None => c.execute(
-                    "UPDATE revisions SET state = 'pending', attempts = 0, next_attempt_at = 0, lease_until = NULL, updated_at = ?
+                    "UPDATE revisions SET state = 'pending', attempts = 0, unfinished = 0, next_attempt_at = 0, lease_until = NULL, updated_at = ?
                      WHERE state = 'failed' AND id = (SELECT MAX(id) FROM revisions r2 WHERE r2.story_id = revisions.story_id)",
                     params![now],
                 )?,
             };
-            // Also hurry up pending revisions waiting for a retry.
+            // Also hurry up pending revisions waiting for a retry — including translations
+            // deferred by an open circuit breaker, which keep their attempt count. (Only
+            // the first stage can be deferred by the update cooldown.)
             match feed_id {
-                Some(f) => c.execute("UPDATE revisions SET next_attempt_at = 0 WHERE state = 'pending' AND feed_id = ? AND attempts > 0", [f])?,
-                None => c.execute("UPDATE revisions SET next_attempt_at = 0 WHERE state = 'pending' AND attempts > 0", [])?,
+                Some(f) => c.execute(
+                    "UPDATE revisions SET next_attempt_at = 0 WHERE state = 'pending' AND feed_id = ? AND (attempts > 0 OR stage = 'translate')",
+                    [f],
+                )?,
+                None => c.execute("UPDATE revisions SET next_attempt_at = 0 WHERE state = 'pending' AND (attempts > 0 OR stage = 'translate')", [])?,
             };
             Ok(n)
         })

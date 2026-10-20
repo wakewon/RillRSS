@@ -101,3 +101,105 @@ async fn failing_feed_backs_off_without_affecting_others() {
     mock.set("/missing.xml", "text/html", "<html>not a feed</html>");
     assert!(rillrss::feeds::fetcher::fetch_feed(&t.app, bad).await.is_err());
 }
+
+async fn exec(t: &TestApp, sql: impl Into<String>) {
+    let sql = sql.into();
+    t.app.db.call(move |c| Ok(c.execute_batch(&sql)?)).await.unwrap();
+}
+
+#[tokio::test]
+async fn revision_that_keeps_crashing_the_process_ends_failed() {
+    let mock = start_mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    mock.set("/f.xml", "application/rss+xml", rss("F", &[entry("1", "One", "https://n.example.com/1", &paragraphs("One", 2))]));
+    let t = start_app_in(dir.path().to_path_buf(), false, |_| {}).await;
+    let fid = t.add_feed(&mock.url("/f.xml"), json!({})).await;
+    rillrss::feeds::fetcher::fetch_feed(&t.app, fid).await.unwrap();
+    // Three runs of the stage started and never finished (the process died each time);
+    // startup clears the lease, so without a count it would be retried forever.
+    exec(&t, "UPDATE revisions SET unfinished = 3, lease_until = strftime('%s','now') + 600").await;
+    tokio::spawn(rillrss::pipeline::run_dispatcher(t.app.clone()));
+    t.wait_idle().await;
+    let (state, err): (String, String) = t.query("SELECT state, last_error FROM revisions", |r| Ok((r.get(0)?, r.get(1)?))).await;
+    assert_eq!(state, "failed");
+    assert!(err.contains("未能完成"), "{err}");
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 0);
+    // An operator retry gives it fresh chances.
+    rillrss::pipeline::retry_failed(&t.app, None).await.unwrap();
+    t.wait_idle().await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 1);
+    t.app.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn permanently_failing_stage_ends_failed_instead_of_retrying_forever() {
+    let mock = start_mock().await;
+    let t = start_app(|_| {}).await;
+    mock.set("/f.xml", "application/rss+xml", rss("F", &[entry("1", "One", "https://n.example.com/1", &paragraphs("One", 2))]));
+    let fid = t.add_feed(&mock.url("/f.xml"), json!({})).await;
+    // An option the transform stage cannot apply (stored behind the form's back).
+    exec(&t, format!("UPDATE feeds SET options = '{{\"opencc\":\"t2x\"}}' WHERE id = {fid}")).await;
+    t.fetch(fid).await;
+    for _ in 0..200 {
+        if t.count("SELECT COUNT(*) FROM revisions WHERE state = 'failed'").await == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (state, stage, err): (String, String, String) =
+        t.query("SELECT state, stage, last_error FROM revisions", |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).await;
+    assert_eq!((state.as_str(), stage.as_str()), ("failed", "transform"));
+    assert!(err.contains("OpenCC") && err.contains("已尝试 5 次"), "{err}");
+}
+
+#[tokio::test]
+async fn opml_restore_keeps_names_and_checks_what_it_imports() {
+    let mock = start_mock().await;
+    mock.set("/a.xml", "application/rss+xml", rss("Upstream A", &[entry("1", "One", "https://n.example.com/1", &paragraphs("One", 1))]));
+    mock.set("/b.xml", "application/rss+xml", rss("Upstream B", &[entry("2", "Two", "https://n.example.com/2", &paragraphs("Two", 1))]));
+    let opml = format!(
+        r#"<?xml version="1.0"?><opml version="2.0" xmlns:rill="https://github.com/rillrss/rillrss"><body>
+<outline type="rss" text="My A" title="My A" xmlUrl="{a}" htmlUrl="javascript:alert(1)" rill:options="{{&quot;opencc&quot;:&quot;t2x&quot;,&quot;translate&quot;:true}}"/>
+<outline type="rss" text="Name B" xmlUrl="{b}" rill:titleLocked="0"/>
+<outline type="rss" text="Local file" xmlUrl="file:///etc/passwd"/>
+</body></opml>"#,
+        a = mock.url("/a.xml"),
+        b = mock.url("/b.xml")
+    );
+    let t = start_app(|_| {}).await;
+    let r = rillrss::opml::import(&t.app, opml.as_bytes()).await.unwrap();
+    assert_eq!((r.found, r.added), (3, 2), "non-http feed refused");
+    for id in [1, 2] {
+        rillrss::feeds::fetcher::fetch_feed(&t.app, id).await.unwrap();
+    }
+    let feeds: Vec<(String, Option<String>, String)> = t
+        .app
+        .db
+        .call(|c| {
+            let mut st = c.prepare("SELECT title, site_url, options FROM feeds ORDER BY id")?;
+            let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await
+        .unwrap();
+    assert_eq!(feeds[0].0, "My A", "a named subscription keeps its name");
+    assert_eq!(feeds[1].0, "Upstream B", "RillRSS export: title was not locked");
+    assert_ne!(feeds[0].1.as_deref(), Some("javascript:alert(1)"));
+    let opts = rillrss::settings::FeedOptions::from_json(&feeds[0].2);
+    assert!(opts.translate && opts.opencc.is_empty(), "unknown OpenCC mode dropped, the rest kept");
+    let xml = rillrss::opml::export(&t.app).await.unwrap();
+    assert!(xml.contains("rill:titleLocked=\"1\"") && xml.contains("rill:titleLocked=\"0\""), "{xml}");
+}
+
+#[tokio::test]
+async fn out_of_range_settings_are_clamped() {
+    let t = start_app(|s| {
+        s.retention.days = 999_999_999;
+        s.fulltext.min_text_chars = 0;
+    })
+    .await;
+    let s = t.app.settings.get().await;
+    assert_eq!(s.retention.days, rillrss::settings::MAX_DAYS);
+    assert_eq!(s.fulltext.min_text_chars, 1);
+    rillrss::maintenance::cleanup(&t.app).await.unwrap();
+}

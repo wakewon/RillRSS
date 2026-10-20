@@ -114,13 +114,14 @@ struct StoryRow {
     source_title: Option<String>,
     source_text: Option<String>,
     version: i64,
+    news_versions: i64,
     first_seen_at: i64,
     last_published_at: Option<i64>,
 }
 
 fn load_story(tx: &Transaction, id: i64) -> Result<StoryRow> {
     Ok(tx.query_row(
-        "SELECT id, title, state, entry_hash, source_title, source_text, version, first_seen_at, last_published_at FROM stories WHERE id = ?",
+        "SELECT id, title, state, entry_hash, source_title, source_text, version, news_versions, first_seen_at, last_published_at FROM stories WHERE id = ?",
         [id],
         |r| {
             Ok(StoryRow {
@@ -131,8 +132,9 @@ fn load_story(tx: &Transaction, id: i64) -> Result<StoryRow> {
                 source_title: r.get(4)?,
                 source_text: r.get(5)?,
                 version: r.get(6)?,
-                first_seen_at: r.get(7)?,
-                last_published_at: r.get(8)?,
+                news_versions: r.get(7)?,
+                first_seen_at: r.get(8)?,
+                last_published_at: r.get(9)?,
             })
         },
     )?)
@@ -360,7 +362,7 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
 
                 // Published story: is it eligible for an update?
                 let too_old = us.track_hours > 0 && s.first_seen_at < now - us.track_hours as i64 * 3600;
-                let max_reached = us.max_versions > 0 && s.version >= us.max_versions as i64;
+                let max_reached = us.max_versions > 0 && s.news_versions >= us.max_versions as i64;
                 // Without a baseline (dropped after the tracking window) nothing can be compared.
                 let no_baseline = s.source_text.is_none();
                 if !track_updates || too_old || max_reached || no_baseline || s.state != "active" {
@@ -450,7 +452,7 @@ mod tests {
         for (rid, sid, title, html) in revs {
             conn.execute("UPDATE revisions SET state = 'published', stage = 'done' WHERE id = ?", [rid]).unwrap();
             conn.execute(
-                "UPDATE stories SET version = version + 1, last_published_at = ?, source_title = ?, source_text = ? WHERE id = ?",
+                "UPDATE stories SET version = version + 1, news_versions = news_versions + 1, last_published_at = ?, source_title = ?, source_text = ? WHERE id = ?",
                 params![now, title, source_text(&html), sid],
             )
             .unwrap();
