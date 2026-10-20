@@ -867,6 +867,11 @@ async fn feed_save(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
     let res = app
         .db
         .call(move |c| {
+            let old_url: String = c.query_row("SELECT url FROM feeds WHERE id = ?", [id], |r| r.get(0))?;
+            if old_url != url {
+                // New address: forget conditional-request state and fetch soon.
+                c.execute("UPDATE feeds SET etag = NULL, last_modified = NULL, next_fetch_at = 0, fetch_error_count = 0 WHERE id = ?", [id])?;
+            }
             c.execute(
                 "UPDATE feeds SET url = ?, category_id = ?, fetch_interval = ?, enabled = ?, options = ?, updated_at = ? WHERE id = ?",
                 params![url, category, interval, enabled as i64, new_opts.to_json(), util::now(), id],

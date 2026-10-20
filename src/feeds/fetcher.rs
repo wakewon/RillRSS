@@ -217,6 +217,7 @@ async fn download(app: &AppRef, settings: &Settings, feed: &FeedRow) -> Result<F
 async fn fetch_and_ingest(app: &AppRef, settings: &Arc<Settings>, feed: &FeedRow) -> Result<(FetchOutcome, CacheMeta)> {
     let f = download(app, settings, feed).await?;
     if f.status == 304 {
+        spawn_icon_refresh(app, feed.clone(), None);
         return Ok((FetchOutcome { status: 304, not_modified: true, ..Default::default() }, CacheMeta::default()));
     }
     if f.status == 429 || f.status == 503 {
@@ -230,6 +231,12 @@ async fn fetch_and_ingest(app: &AppRef, settings: &Arc<Settings>, feed: &FeedRow
     let base = f.final_url.to_string();
     let body = f.body;
     let parsed: ParsedFeed = tokio::task::spawn_blocking(move || parse_feed(&body, &base)).await??;
+    // Icon lookup uses the freshly parsed site URL (the stored one may not be known yet).
+    let mut icon_feed = feed.clone();
+    if parsed.site_url.is_some() {
+        icon_feed.site_url = parsed.site_url.clone();
+    }
+    let feed_image = parsed.icon_url.clone();
 
     let now = util::now();
     let feed_id = feed.id;
@@ -253,15 +260,18 @@ async fn fetch_and_ingest(app: &AppRef, settings: &Arc<Settings>, feed: &FeedRow
         .await?;
 
     // Fetch the favicon occasionally (in the background).
-    let app2 = app.clone();
-    let feed2 = feed.clone();
-    tokio::spawn(async move {
-        if let Err(e) = super::icons::refresh_icon_if_stale(&app2, &feed2).await {
-            tracing::debug!(feed = feed2.id, "icon refresh failed: {e:#}");
-        }
-    });
+    spawn_icon_refresh(app, icon_feed, feed_image);
 
     Ok((FetchOutcome { status: 200, not_modified: false, report }, meta))
+}
+
+fn spawn_icon_refresh(app: &AppRef, feed: FeedRow, feed_image: Option<String>) {
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = super::icons::refresh_icon_if_stale(&app2, &feed, feed_image.as_deref()).await {
+            tracing::debug!(feed = feed.id, "icon refresh failed: {e:#}");
+        }
+    });
 }
 
 /// Scheduler loop: picks due feeds and fetches them with bounded concurrency.

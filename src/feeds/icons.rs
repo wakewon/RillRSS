@@ -21,7 +21,7 @@ fn sniff_icon(b: &[u8]) -> Option<&'static str> {
     crate::content::images::sniff(b).map(|(m, _)| m)
 }
 
-pub async fn refresh_icon_if_stale(app: &AppRef, feed: &FeedRow) -> Result<()> {
+pub async fn refresh_icon_if_stale(app: &AppRef, feed: &FeedRow, feed_image: Option<&str>) -> Result<()> {
     let id = feed.id;
     let fetched: Option<(i64, usize)> = app
         .db
@@ -43,7 +43,7 @@ pub async fn refresh_icon_if_stale(app: &AppRef, feed: &FeedRow) -> Result<()> {
         .clone()
         .or_else(|| Url::parse(&feed.url).ok().map(|u| format!("{}://{}/", u.scheme(), u.host_str().unwrap_or(""))))
         .unwrap_or_default();
-    let result = fetch_icon(app, &site).await;
+    let result = fetch_icon(app, &site, feed_image).await;
     let (mime, data) = match result {
         Ok(v) => v,
         Err(e) => {
@@ -64,7 +64,7 @@ pub async fn refresh_icon_if_stale(app: &AppRef, feed: &FeedRow) -> Result<()> {
         .await
 }
 
-async fn fetch_icon(app: &AppRef, site: &str) -> Result<(String, Vec<u8>)> {
+async fn fetch_icon(app: &AppRef, site: &str, feed_image: Option<&str>) -> Result<(String, Vec<u8>)> {
     let settings = app.settings.get().await;
     let ua = settings.fetch.user_agent.clone();
     let timeout = Duration::from_secs(15);
@@ -99,7 +99,12 @@ async fn fetch_icon(app: &AppRef, site: &str) -> Result<(String, Vec<u8>)> {
     if let Ok(u) = base.join("/favicon.ico") {
         candidates.push(u.to_string());
     }
-    for c in candidates.iter().take(4) {
+    // The feed's own image/logo as a last resort.
+    if let Some(img) = feed_image.filter(|i| i.starts_with("http")) {
+        candidates.push(img.to_string());
+    }
+    candidates.dedup();
+    for c in candidates.iter().take(5) {
         if let Ok(f) = http::get(&app.http.content, c, &ua, timeout, 512 * 1024, app.http.public_only, "image/*").await
             && f.status < 400
             && let Some(mime) = sniff_icon(&f.body)

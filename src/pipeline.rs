@@ -458,7 +458,7 @@ async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
         Err(PageError::Transient(e)) | Err(PageError::Permanent(e)) => {
             app.event(Level::Warn, "extract", EventRef::story(rev.feed_id, rev.story_id), format!("full text failed, using feed content: {e}"))
                 .await;
-            if rev.reason != "new" {
+            if rev.reason == "entry_update" {
                 // Can't confirm the update without the page.
                 return Ok(Outcome::Unchanged(format!("page unavailable: {e}")));
             }
@@ -470,7 +470,7 @@ async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
     let entry_len = text_len(&entry_html);
     let min = settings.fulltext.min_text_chars as usize;
     if got < min.min(entry_len.max(1) * 3) || (entry_len > 300 && got * 2 < entry_len) {
-        if rev.reason != "new" {
+        if rev.reason == "entry_update" {
             return Ok(Outcome::Unchanged("extracted page too short".into()));
         }
         return Ok(fallback(format!("full text too short ({got} chars), using feed content")));
