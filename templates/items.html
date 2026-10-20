@@ -1,31 +1,43 @@
 {% extends "base.html" %}
 {% block title %}文章{% endblock %}
 {% block content %}
-<h1>文章</h1>
-<form method="get" action="/admin/items" class="card row">
-  <div><label>订阅</label><select name="feed"><option value="">全部</option>{% for f in feeds %}<option value="{{ f.0 }}" {% if f.2 %}selected{% endif %}>{{ f.1 }}</option>{% endfor %}</select></div>
-  <div><label>状态</label><select name="state">
-    <option value="" {% if state == "" %}selected{% endif %}>全部</option>
-    <option value="unread" {% if state == "unread" %}selected{% endif %}>未读</option>
-    <option value="starred" {% if state == "starred" %}selected{% endif %}>收藏</option>
-    <option value="updated" {% if state == "updated" %}selected{% endif %}>更新版本</option>
-  </select></div>
-  <div><label>搜索标题</label><input type="text" name="q" value="{{ q }}"></div>
-  <div class="shrink"><button>筛选</button></div>
+<div class="page-head"><div><h1>文章</h1><div class="sub">只读浏览，用于检查处理结果；阅读请使用客户端</div></div></div>
+<form method="get" action="/admin/items" class="card">
+  <div class="form-row">
+    <div class="field grow"><label for="f_q">搜索标题</label><input type="search" id="f_q" name="q" value="{{ q }}" placeholder="关键词"></div>
+    <div class="field fixed" style="width:200px"><label for="f_feed">订阅</label><select id="f_feed" name="feed"><option value="">全部订阅</option>{% for f in feeds %}<option value="{{ f.0 }}" {% if f.2 %}selected{% endif %}>{{ f.1 }}</option>{% endfor %}</select></div>
+    <div class="field fixed" style="width:140px"><label for="f_state">状态</label><select id="f_state" name="state">
+      <option value="" {% if state == "" %}selected{% endif %}>全部</option>
+      <option value="unread" {% if state == "unread" %}selected{% endif %}>未读</option>
+      <option value="starred" {% if state == "starred" %}selected{% endif %}>收藏</option>
+      <option value="updated" {% if state == "updated" %}selected{% endif %}>更新版本</option>
+    </select></div>
+    <div class="fixed"><button class="btn primary"><svg class="icon sm"><use href="#i-search"/></svg>筛选</button></div>
+  </div>
 </form>
-<div class="table-wrap"><table>
-<tr><th class="num">ID</th><th>标题</th><th>订阅</th><th>版本</th><th>状态</th><th>发布</th><th>入库</th></tr>
-{% for i in items %}
-<tr>
-  <td class="num small">{{ i.id }}</td>
-  <td class="ellipsis"><a href="/admin/items/{{ i.id }}">{{ i.title }}</a></td>
-  <td class="small ellipsis">{{ i.feed }}</td>
-  <td>{% if i.version > 1 %}<span class="badge on">v{{ i.version }}</span>{% endif %}{% if let Some(s) = i.superseded_by %}<a class="badge" href="/admin/items/{{ s }}">旧版→{{ s }}</a>{% endif %}</td>
-  <td>{% if !i.read %}<span class="badge on">未读</span>{% endif %}{% if i.starred %}<span class="badge on">★</span>{% endif %}</td>
-  <td class="small" style="white-space:nowrap">{{ i.published }}</td>
-  <td class="small" style="white-space:nowrap">{{ i.created }}</td>
-</tr>
-{% endfor %}
-</table></div>
-{% if let Some(next) = next_before %}<a class="btn secondary" href="/admin/items?{{ query_prefix }}before={{ next }}">更早 →</a>{% endif %}
+<div class="card flush">
+{% if items.is_empty() %}
+  <div class="empty"><svg class="icon"><use href="#i-file"/></svg><div>没有符合条件的文章</div></div>
+{% else %}
+  <div class="table-wrap"><table>
+  <thead><tr><th>标题</th><th>状态</th><th class="hide-sm">发布时间</th><th class="hide-sm">入库</th></tr></thead>
+  <tbody>
+  {% for i in items %}
+  <tr>
+    <td class="fill">
+      <div class="cell-title">
+        {% if i.has_icon %}<img class="favicon" src="/feed-icons/{{ i.feed_id }}.ico" alt="" loading="lazy">{% else %}<span class="favicon letter">{{ i.feed_initial }}</span>{% endif %}
+        <div style="min-width:0"><a class="t ellipsis {% if i.read %}read{% endif %}" style="display:block" href="/admin/items/{{ i.id }}">{{ i.title }}</a><div class="sub ellipsis">{{ i.feed }} · #{{ i.id }}</div></div>
+      </div>
+    </td>
+    <td><div class="badges">{% if !i.read %}<span class="badge accent">未读</span>{% endif %}{% if i.starred %}<span class="badge warn">★ 收藏</span>{% endif %}{% if i.version > 1 %}<span class="badge ok">v{{ i.version }}</span>{% endif %}{% if let Some(s) = i.superseded_by %}<a class="badge" href="/admin/items/{{ s }}" title="已被 #{{ s }} 取代">旧版</a>{% endif %}</div></td>
+    <td class="hide-sm small text-2 nowrap"><time datetime="{{ i.published.iso }}" data-local>{{ i.published.text }}</time></td>
+    <td class="hide-sm small text-2 nowrap"><time datetime="{{ i.created.iso }}" data-local>{{ i.created.text }}</time></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+  </table></div>
+{% endif %}
+</div>
+{% if let Some(next) = next_before %}<div class="pager"><a class="btn" href="/admin/items?{{ query_prefix }}before={{ next }}">更早的文章 →</a></div>{% endif %}
 {% endblock %}

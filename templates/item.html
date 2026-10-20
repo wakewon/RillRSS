@@ -1,29 +1,53 @@
 {% extends "base.html" %}
 {% block title %}{{ it.title }}{% endblock %}
 {% block content %}
-<h1>{{ it.title }}</h1>
-<p class="small muted">#{{ it.id }} · {{ it.feed }} · 版本 v{{ it.version }} · 发布 {{ it.published }} · 入库 {{ it.created }}
-{% if !it.link.is_empty() %} · <a href="{{ it.link }}" rel="noreferrer">原文</a>{% endif %}
-{% if let Some(s) = it.superseded_by %} · <a href="/admin/items/{{ s }}">已被 #{{ s }} 取代</a>{% endif %}</p>
-<div class="actions">
-  {% if let Some(sid) = it.story_id %}
-  <form method="post" action="/admin/stories/{{ sid }}/reprocess" class="inline" data-confirm="重新处理并以新版本发布？"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">重新处理</button></form>
-  {% endif %}
+<div class="crumbs"><a href="/admin/items">文章</a><span>/</span><a href="/admin/feeds/{{ it.feed_id }}">{{ it.feed }}</a></div>
+<div class="page-head">
+  <div style="min-width:0">
+    <h1>{{ it.title }}</h1>
+    <div class="sub">#{{ it.id }} · v{{ it.version }} · 发布于 <time datetime="{{ it.published.iso }}" data-local>{{ it.published.text }}</time>{% if !it.link.is_empty() %} · <a href="{{ it.link }}" rel="noreferrer" target="_blank">原文 <svg class="icon sm"><use href="#i-external"/></svg></a>{% endif %}</div>
+  </div>
+  <div class="actions">
+    {% if let Some(sid) = it.story_id %}
+    <form method="post" action="/admin/stories/{{ sid }}/reprocess" class="inline" data-confirm="按当前设置重新处理，并以新版本发布？"><input type="hidden" name="csrf" value="{{ base.csrf }}"><input type="hidden" name="item" value="{{ it.id }}"><button class="btn"><svg class="icon sm"><use href="#i-refresh"/></svg>重新处理</button></form>
+    {% endif %}
+  </div>
 </div>
-{% if !versions.is_empty() %}
-<h3>版本记录</h3>
-<div class="table-wrap"><table>
-<tr><th>版本</th><th>ID</th><th>标题</th><th>入库</th><th>状态</th></tr>
-{% for v in versions %}<tr><td>v{{ v.version }}</td><td><a href="/admin/items/{{ v.id }}">#{{ v.id }}</a></td><td class="ellipsis">{{ v.title }}</td><td class="small">{{ v.created }}</td><td>{% if v.read %}已读{% else %}未读{% endif %}{% if v.starred %} ★{% endif %}</td></tr>{% endfor %}
-</table></div>
-{% endif %}
-{% if !revisions.is_empty() %}
-<h3>处理记录</h3>
-<div class="table-wrap"><table>
-<tr><th>#</th><th>原因</th><th>状态</th><th>阶段</th><th>尝试</th><th>备注 / 错误</th><th>更新</th></tr>
-{% for r in revisions %}<tr><td class="small">{{ r.id }}</td><td>{{ r.reason }}</td><td>{{ r.state }}</td><td>{{ r.stage }}</td><td class="num">{{ r.attempts }}</td><td class="small">{{ r.notes }}{% if !r.error.is_empty() %}<div class="err">{{ r.error }}</div>{% endif %}</td><td class="small">{{ r.updated }}</td></tr>{% endfor %}
-</table></div>
-{% endif %}
-<h3>内容预览</h3>
-<div class="preview">{{ it.content|safe }}</div>
+{% if let Some(s) = it.superseded_by %}<div class="flash warn"><svg class="icon"><use href="#i-layers"/></svg><div>这是旧版本，已被 <a href="/admin/items/{{ s }}">#{{ s }}</a> 取代。</div></div>{% endif %}
+<div class="grid-side">
+  <article class="reader">{{ it.content|safe }}</article>
+  <div class="stack">
+    <div class="card">
+      <div class="card-head"><h3>状态</h3></div>
+      <dl class="kv">
+        <dt>阅读</dt><dd>{% if it.read %}已读{% else %}<span class="badge accent">未读</span>{% endif %}{% if it.starred %} <span class="badge warn">★ 收藏</span>{% endif %}</dd>
+        <dt>入库</dt><dd><time datetime="{{ it.created.iso }}" data-local>{{ it.created.text }}</time></dd>
+      </dl>
+    </div>
+    {% if versions.len() > 1 %}
+    <div class="card flush">
+      <div class="card-head"><h3>版本</h3><span class="hint">{{ versions.len() }} 个</span></div>
+      <ul class="list">
+      {% for v in versions %}
+        <li class="{% if v.id == it.id %}current{% endif %}"><a href="/admin/items/{{ v.id }}"><span class="badge {% if v.id == it.id %}accent{% endif %}">v{{ v.version }}</span><span class="ellipsis grow">{{ v.title }}</span></a><div class="meta">#{{ v.id }} · <time datetime="{{ v.created.iso }}" data-local>{{ v.created.text }}</time> · {% if v.read %}已读{% else %}未读{% endif %}{% if v.starred %} · ★{% endif %}</div></li>
+      {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    {% if !revisions.is_empty() %}
+    <div class="card flush">
+      <div class="card-head"><h3>处理记录</h3></div>
+      <ul class="list">
+      {% for r in revisions %}
+        <li><div class="row-between"><span><span class="badge {{ r.state_class }}">{{ r.state }}</span> {{ r.reason }}</span><time class="muted small" datetime="{{ r.updated.iso }}">{{ r.updated.text }}</time></div>
+          <div class="meta">#{{ r.id }} · 阶段 {{ r.stage }} · 尝试 {{ r.attempts }} 次</div>
+          {% if !r.notes.is_empty() %}<div class="meta text-2">{{ r.notes }}</div>{% endif %}
+          {% if !r.error.is_empty() %}<div class="meta err">{{ r.error }}</div>{% endif %}
+        </li>
+      {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+</div>
 {% endblock %}

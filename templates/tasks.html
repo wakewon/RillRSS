@@ -1,25 +1,72 @@
 {% extends "base.html" %}
 {% block title %}任务{% endblock %}
 {% block content %}
-<h1>任务</h1>
-<div class="actions">
-  <form method="post" action="/admin/tasks/retry" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button>重试所有失败任务</button></form>
-  <form method="post" action="/admin/maintenance/cleanup" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">立即执行清理</button></form>
+<div class="page-head">
+  <div><h1>任务</h1><div class="sub">处理中 {{ pending_total }} · 失败 {{ failed_total }} · 抓取出错的订阅 {{ feed_errors.len() }}</div></div>
+  <div class="actions">
+    <form method="post" action="/admin/maintenance/cleanup" class="inline" data-confirm="立即按保留策略清理过期文章、旧版本、图片与缓存？"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="btn"><svg class="icon sm"><use href="#i-trash"/></svg>立即清理</button></form>
+    <form method="post" action="/admin/tasks/retry" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="btn primary"><svg class="icon sm"><use href="#i-refresh"/></svg>立即重试失败与等待中的任务</button></form>
+  </div>
 </div>
-<h2>处理中 / 等待重试</h2>
-<div class="table-wrap"><table>
-<tr><th>#</th><th>订阅</th><th>标题</th><th>原因</th><th>阶段</th><th class="num">尝试</th><th>下次尝试</th><th>最近错误</th></tr>
-{% for r in pending %}<tr><td class="small">{{ r.id }}</td><td class="small"><a href="/admin/feeds/{{ r.feed_id }}">{{ r.feed }}</a></td><td class="ellipsis">{{ r.title }}</td><td>{{ r.reason }}</td><td>{{ r.stage }}</td><td class="num">{{ r.attempts }}</td><td class="small">{{ r.next }}</td><td class="small err">{{ r.error }}</td></tr>{% endfor %}
-</table></div>
-{% if pending.is_empty() %}<p class="muted">队列为空。</p>{% endif %}
-<h2>失败</h2>
-<div class="table-wrap"><table>
-<tr><th>#</th><th>订阅</th><th>标题</th><th>原因</th><th>阶段</th><th>错误</th><th>时间</th></tr>
-{% for r in failed %}<tr><td class="small">{{ r.id }}</td><td class="small"><a href="/admin/feeds/{{ r.feed_id }}">{{ r.feed }}</a></td><td class="ellipsis">{{ r.title }}</td><td>{{ r.reason }}</td><td>{{ r.stage }}</td><td class="small err">{{ r.error }}</td><td class="small">{{ r.next }}</td></tr>{% endfor %}
-</table></div>
-<h2>订阅抓取错误</h2>
-<div class="table-wrap"><table>
-<tr><th>订阅</th><th class="num">连续失败</th><th>错误</th><th>下次抓取</th></tr>
-{% for f in feed_errors %}<tr><td><a href="/admin/feeds/{{ f.0 }}">{{ f.1 }}</a></td><td class="num">{{ f.2 }}</td><td class="small err">{{ f.3 }}</td><td class="small">{{ f.4 }}</td></tr>{% endfor %}
-</table></div>
+
+<div class="card">
+  <div class="card-head"><h3>批量重新处理</h3><span class="hint">修改设置后，让已发布的文章按新设置更新</span></div>
+  <form method="post" action="/admin/reprocess" data-confirm="按所选范围重新处理文章？范围较大时需要较长时间，启用翻译会产生 API 调用。">
+    <input type="hidden" name="csrf" value="{{ base.csrf }}">
+    <div class="form-row">
+      <div class="field grow"><label for="bp_feed">订阅</label><select id="bp_feed" name="feed"><option value="">全部订阅</option>{% for f in feeds %}<option value="{{ f.0 }}">{{ f.1 }}</option>{% endfor %}</select></div>
+      <div class="field fixed" style="width:170px"><label for="bp_scope">范围</label><select id="bp_scope" name="scope">{% for o in scopes %}<option value="{{ o.0 }}">{{ o.1 }}</option>{% endfor %}</select></div>
+      <div class="fixed" style="padding-bottom:7px"><label class="switch"><input type="checkbox" name="unread_only" value="on"><span class="text">仅未读</span></label></div>
+      <div class="fixed"><button class="btn primary">开始</button></div>
+    </div>
+    <div class="help" style="margin-top:10px">新版本以新 ID 发布（移动端阅读器不会刷新已缓存的文章），保留已读、收藏状态与原发布时间；已读的旧版本会被隐藏。新文章始终优先处理，已翻译过的段落会命中缓存。</div>
+  </form>
+</div>
+
+<div class="card flush">
+  <div class="card-head"><h3>处理中 / 等待重试</h3><span class="hint">共 {{ pending_total }} 条{% if pending.len() == 200 %}，显示最早的 200 条{% endif %}</span></div>
+  {% if pending.is_empty() %}<div class="empty compact"><svg class="icon"><use href="#i-check"/></svg><div>队列为空</div></div>{% else %}
+  <div class="table-wrap"><table>
+  <thead><tr><th>文章</th><th>阶段</th><th class="hide-sm">原因</th><th class="num hide-sm">尝试</th><th>下次</th></tr></thead>
+  <tbody>
+  {% for r in pending %}<tr>
+    <td class="fill"><div class="ellipsis">{{ r.title }}</div><div class="sub ellipsis"><a href="/admin/feeds/{{ r.feed_id }}">{{ r.feed }}</a> · #{{ r.id }}</div>{% if !r.error.is_empty() %}<div class="sub err clamp">{{ r.error }}</div>{% endif %}</td>
+    <td class="nowrap">{{ r.stage }}</td>
+    <td class="hide-sm nowrap text-2">{{ r.reason }}</td>
+    <td class="num hide-sm">{{ r.attempts }}</td>
+    <td class="small text-2 nowrap"><time datetime="{{ r.next.iso }}">{{ r.next.text }}</time></td>
+  </tr>{% endfor %}
+  </tbody>
+  </table></div>
+  {% endif %}
+</div>
+
+{% if !failed.is_empty() %}
+<div class="card flush">
+  <div class="card-head"><h3>失败</h3><span class="hint">{{ failed_total }} 条</span></div>
+  <div class="table-wrap"><table>
+  <thead><tr><th>文章</th><th>阶段</th><th class="hide-sm">原因</th><th>时间</th></tr></thead>
+  <tbody>
+  {% for r in failed %}<tr>
+    <td class="fill"><div class="ellipsis">{{ r.title }}</div><div class="sub ellipsis"><a href="/admin/feeds/{{ r.feed_id }}">{{ r.feed }}</a> · #{{ r.id }}</div>{% if !r.error.is_empty() %}<div class="sub err clamp">{{ r.error }}</div>{% endif %}</td>
+    <td class="nowrap">{{ r.stage }}</td>
+    <td class="hide-sm nowrap text-2">{{ r.reason }}</td>
+    <td class="small text-2 nowrap"><time datetime="{{ r.next.iso }}">{{ r.next.text }}</time></td>
+  </tr>{% endfor %}
+  </tbody>
+  </table></div>
+</div>
+{% endif %}
+
+{% if !feed_errors.is_empty() %}
+<div class="card flush">
+  <div class="card-head"><h3>订阅抓取错误</h3></div>
+  <div class="table-wrap"><table>
+  <thead><tr><th>订阅</th><th class="num">连续失败</th><th>下次抓取</th></tr></thead>
+  <tbody>
+  {% for f in feed_errors %}<tr><td class="fill"><a href="/admin/feeds/{{ f.0 }}">{{ f.1 }}</a><div class="sub err clamp">{{ f.3 }}</div></td><td class="num">{{ f.2 }}</td><td class="small text-2 nowrap">{{ f.4 }}</td></tr>{% endfor %}
+  </tbody>
+  </table></div>
+</div>
+{% endif %}
 {% endblock %}

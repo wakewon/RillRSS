@@ -1,0 +1,14 @@
+{% if events.is_empty() %}<div class="empty"><svg class="icon"><use href="#i-list"/></svg><div>暂无事件</div></div>{% else %}
+<ul class="events">
+{% for e in events %}
+<li>
+  <span class="dot {{ e.level_class }}"></span>
+  <div>
+    <div class="msg">{{ e.message }}</div>
+    <div class="meta"><span>{{ e.kind_label }}</span>{% if let Some(fid) = e.feed_id %}<a href="/admin/feeds/{{ fid }}">{{ e.feed_title }}</a>{% endif %}{% if let Some(iid) = e.item_id %}<a href="/admin/items/{{ iid }}">文章 #{{ iid }}</a>{% endif %}</div>
+  </div>
+  <time datetime="{{ e.time.iso }}">{{ e.time.text }}</time>
+</li>
+{% endfor %}
+</ul>
+{% endif %}

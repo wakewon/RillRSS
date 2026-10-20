@@ -1,14 +1,18 @@
 {% extends "base.html" %}
 {% block title %}日志{% endblock %}
 {% block content %}
-<h1>日志</h1>
-<form method="get" action="/admin/events" class="card row">
-  <div><label>级别</label><select name="level">
-    <option value="" {% if level == "" %}selected{% endif %}>全部</option>
-    <option value="warn" {% if level == "warn" %}selected{% endif %}>警告及以上</option>
-    <option value="error" {% if level == "error" %}selected{% endif %}>仅错误</option></select></div>
-  <div><label>类型</label><input type="text" name="kind" value="{{ kind }}" placeholder="fetch / translate / update …"></div>
-  <div class="shrink"><button>筛选</button></div>
+<div class="page-head"><div><h1>日志</h1><div class="sub">最近 300 条事件</div></div></div>
+<form method="get" action="/admin/events" class="card">
+  <div class="form-row">
+    <div class="field fixed" style="width:170px"><label for="ev_level">级别</label><select id="ev_level" name="level">
+      <option value="" {% if level == "" %}selected{% endif %}>全部</option>
+      <option value="warn" {% if level == "warn" %}selected{% endif %}>警告及错误</option>
+      <option value="error" {% if level == "error" %}selected{% endif %}>仅错误</option></select></div>
+    <div class="field fixed" style="width:170px"><label for="ev_kind">类型</label><select id="ev_kind" name="kind">
+      <option value="">全部类型</option>
+      {% for k in kinds %}<option value="{{ k.0 }}" {% if kind == k.0 %}selected{% endif %}>{{ k.1 }}</option>{% endfor %}</select></div>
+    <div class="fixed"><button class="btn primary">筛选</button></div>
+  </div>
 </form>
-{% include "events_table.html" %}
+<div class="card flush">{% include "events_list.html" %}</div>
 {% endblock %}

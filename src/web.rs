@@ -25,11 +25,13 @@ use crate::util::{self, fmt_relative, fmt_ts, html::expand_base, human_bytes, tr
 const COOKIE: &str = "rill_session";
 const SESSION_DAYS: u64 = 30;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The stylesheet is inlined into every page so the admin never renders unstyled
+/// (e.g. behind a proxy that mangles or blocks the extra request).
+const CSS: &str = include_str!("../static/admin.css");
 
 pub fn router() -> Router<AppRef> {
     Router::new()
         .route("/", get(|| async { Redirect::to("/admin") }))
-        .route("/admin/static/admin.css", get(css))
         .route("/admin/login", get(login_page).post(login_post))
         .route("/admin/logout", post(logout))
         .route("/admin", get(dashboard))
@@ -49,6 +51,7 @@ pub fn router() -> Router<AppRef> {
         .route("/admin/stories/{id}/reprocess", post(story_reprocess))
         .route("/admin/tasks", get(tasks_page))
         .route("/admin/tasks/retry", post(tasks_retry))
+        .route("/admin/reprocess", post(bulk_reprocess))
         .route("/admin/maintenance/cleanup", post(run_cleanup))
         .route("/admin/events", get(events_page))
         .route("/admin/settings", get(settings_page).post(settings_save))
@@ -74,6 +77,7 @@ pub struct Base {
     pub csrf: String,
     pub nav: &'static str,
     pub version: &'static str,
+    pub css: &'static str,
     pub flash: Option<String>,
     pub error: Option<String>,
 }
@@ -155,7 +159,7 @@ struct FlashQuery {
 }
 
 fn base(s: &Session, nav: &'static str, q: &FlashQuery) -> Base {
-    Base { csrf: s.csrf.clone(), nav, version: VERSION, flash: q.msg.clone(), error: q.err.clone() }
+    Base { csrf: s.csrf.clone(), nav, version: VERSION, css: CSS, flash: q.msg.clone(), error: q.err.clone() }
 }
 
 fn redirect_msg(path: &str, msg: &str) -> Response {
@@ -186,10 +190,10 @@ impl Form {
 }
 
 /// Authenticate + CSRF check for POST handlers.
-async fn post_guard(app: &AppRef, headers: &HeaderMap, form: &Form) -> Result<Session, Response> {
-    let Some(s) = session(app, headers).await else { return Err(to_login()) };
+async fn post_guard(app: &AppRef, headers: &HeaderMap, form: &Form) -> Result<Session, Box<Response>> {
+    let Some(s) = session(app, headers).await else { return Err(Box::new(to_login())) };
     if form.get("csrf").is_none_or(|c| !auth::ct_eq(c, &s.csrf)) {
-        return Err((StatusCode::FORBIDDEN, "invalid CSRF token, please reload the page").into_response());
+        return Err(Box::new((StatusCode::FORBIDDEN, "invalid CSRF token, please reload the page").into_response()));
     }
     Ok(s)
 }
@@ -207,16 +211,34 @@ macro_rules! guard_post {
     ($app:expr, $headers:expr, $form:expr) => {
         match post_guard(&$app, &$headers, &$form).await {
             Ok(s) => s,
-            Err(r) => return r,
+            Err(r) => return *r,
         }
     };
 }
 
-async fn css() -> Response {
-    let mut r = include_str!("../static/admin.css").into_response();
-    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8"));
-    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
-    r
+/// A timestamp for templates: `iso` feeds `<time datetime>` (the browser shows local
+/// time), `text` is the server-side fallback.
+pub struct Ts {
+    pub iso: String,
+    pub text: String,
+}
+
+impl Ts {
+    /// Absolute time (rewritten to the viewer's local time by the page script).
+    fn abs(ts: Option<i64>) -> Ts {
+        Ts { iso: iso(ts), text: fmt_ts(ts).replace(":00 UTC", "").replace(" UTC", "") }
+    }
+    /// Relative time ("5 分钟前"); the local absolute time shows on hover.
+    fn rel(ts: Option<i64>) -> Ts {
+        Ts { iso: iso(ts), text: fmt_relative(ts) }
+    }
+}
+
+fn iso(ts: Option<i64>) -> String {
+    ts.filter(|t| *t > 0)
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +248,7 @@ async fn css() -> Response {
 #[derive(Template)]
 #[template(path = "login.html")]
 struct LoginT {
+    css: &'static str,
     username: String,
     error: Option<String>,
 }
@@ -234,7 +257,7 @@ async fn login_page(State(app): State<AppRef>, headers: HeaderMap) -> Response {
     if session(&app, &headers).await.is_some() {
         return Redirect::to("/admin").into_response();
     }
-    render(LoginT { username: app.cfg.username.clone(), error: None })
+    render(LoginT { css: CSS, username: app.cfg.username.clone(), error: None })
 }
 
 async fn login_post(State(app): State<AppRef>, headers: HeaderMap, ConnectInfo(peer): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
@@ -242,7 +265,7 @@ async fn login_post(State(app): State<AppRef>, headers: HeaderMap, ConnectInfo(p
     let user = form.get("username").unwrap_or("").to_string();
     let pass = form.get("password").unwrap_or("");
     let ip = client_ip(&app, &headers, Some(peer));
-    let fail = |msg: &str| render(LoginT { username: user.clone(), error: Some(msg.to_string()) });
+    let fail = |msg: &str| render(LoginT { css: CSS, username: user.clone(), error: Some(msg.to_string()) });
     if auth::login_blocked(&app, ip) {
         return fail("尝试次数过多，请 15 分钟后再试。");
     }
@@ -307,18 +330,29 @@ struct Stats {
     tr_cache_hits: u64,
     tr_tokens: u64,
     tr_in_flight: u32,
+    /// "ok" | "err" | "idle" — drives the status dot.
+    tr_state: &'static str,
+    tr_state_label: String,
     tr_last_error: Option<String>,
+    tr_hint: Option<&'static str>,
 }
 
 pub struct EventRow {
-    pub time: String,
-    pub level: String,
+    pub time: Ts,
     pub level_class: &'static str,
-    pub kind: String,
+    pub kind_label: &'static str,
     pub feed_id: Option<i64>,
     pub feed_title: String,
     pub item_id: Option<i64>,
     pub message: String,
+}
+
+pub struct StageRow {
+    name: &'static str,
+    due: i64,
+    waiting: i64,
+    due_pct: i64,
+    wait_pct: i64,
 }
 
 #[derive(Template)]
@@ -326,8 +360,37 @@ pub struct EventRow {
 struct DashboardT {
     base: Base,
     s: Stats,
-    stages: Vec<(String, i64, i64)>,
+    stages: Vec<StageRow>,
+    queue_total: i64,
     events: Vec<EventRow>,
+}
+
+/// Event kinds as shown in the admin (kinds are stable identifiers in the DB).
+pub const EVENT_KINDS: &[(&str, &str)] = &[
+    ("fetch", "抓取"),
+    ("extract", "全文提取"),
+    ("transform", "清理/繁简"),
+    ("translate", "翻译"),
+    ("images", "图片缓存"),
+    ("publish", "发布"),
+    ("update", "新闻更新"),
+    ("cleanup", "清理"),
+    ("api", "API"),
+    ("system", "系统"),
+];
+
+fn kind_label(kind: &str) -> &'static str {
+    EVENT_KINDS.iter().find(|(k, _)| *k == kind).map(|(_, l)| *l).unwrap_or("其他")
+}
+
+fn reason_label(reason: &str) -> &'static str {
+    match reason {
+        "new" => "新文章",
+        "entry_update" => "条目更新",
+        "page_update" => "页面更新",
+        "reprocess" => "重新处理",
+        _ => "其他",
+    }
 }
 
 fn load_events(c: &rusqlite::Connection, feed: Option<i64>, level: &str, kind: &str, limit: i64) -> anyhow::Result<Vec<EventRow>> {
@@ -352,14 +415,13 @@ fn load_events(c: &rusqlite::Connection, feed: Option<i64>, level: &str, kind: &
     let rows = st.query_map(rusqlite::params_from_iter(p), |r| {
         let level: String = r.get(1)?;
         Ok(EventRow {
-            time: fmt_ts(r.get(0)?).replace(" UTC", ""),
+            time: Ts::rel(r.get(0)?),
             level_class: match level.as_str() {
                 "error" => "err",
                 "warn" => "warn",
-                _ => "muted",
+                _ => "",
             },
-            level,
-            kind: r.get(2)?,
+            kind_label: kind_label(&r.get::<_, String>(2)?),
             feed_id: r.get(3)?,
             feed_title: r.get(4)?,
             item_id: r.get(5)?,
@@ -384,7 +446,11 @@ async fn dashboard(State(app): State<AppRef>, headers: HeaderMap, Query(q): Quer
                 starred: one("SELECT COUNT(*) FROM items WHERE is_starred = 1")?,
                 pending: one("SELECT COUNT(*) FROM revisions WHERE state = 'pending'")?,
                 failed: one("SELECT COUNT(*) FROM revisions WHERE state = 'failed'")?,
-                updates: one("SELECT COUNT(*) FROM items WHERE version > 1 AND created_at > (strftime('%s','now') - 86400) * 1000000")?,
+                // News updates only (reprocessed versions are not news).
+                updates: one(
+                    "SELECT COUNT(*) FROM revisions r JOIN items i ON i.id = r.item_id
+                     WHERE r.state = 'published' AND r.reason IN ('entry_update', 'page_update') AND i.created_at > (strftime('%s','now') - 86400) * 1000000",
+                )?,
                 images: one("SELECT COUNT(*) FROM images")?,
                 ..Default::default()
             };
@@ -401,13 +467,13 @@ async fn dashboard(State(app): State<AppRef>, headers: HeaderMap, Query(q): Quer
                     [stage],
                     |r| r.get(0),
                 )?;
-                stages.push((stage_name(stage).to_string(), due, waiting));
+                stages.push(StageRow { name: stage_name(stage), due, waiting, due_pct: 0, wait_pct: 0 });
             }
-            let events = load_events(c, None, "", "", 15)?;
+            let events = load_events(c, None, "", "", 10)?;
             Ok((st, stages, events))
         })
         .await;
-    let (mut st, stages, events) = match data {
+    let (mut st, mut stages, events) = match data {
         Ok(d) => d,
         Err(e) => return server_error(e),
     };
@@ -422,15 +488,35 @@ async fn dashboard(State(app): State<AppRef>, headers: HeaderMap, Query(q): Quer
     st.api_password = auth::has_api_password(&app).await.unwrap_or(false);
     st.tr_configured = settings.translation.is_configured();
     st.tr_model = settings.translation.model.clone();
-    st.tr_circuit = app.translator.circuit_open_for().map(|d| format!("{} 秒", d.as_secs()));
+    st.tr_circuit = app.translator.circuit_open_for().map(|d| match d.as_secs() {
+        s if s < 90 => format!("{s} 秒"),
+        s => format!("{} 分钟", s.div_ceil(60)),
+    });
     let ts = app.translator.stats();
     st.tr_requests = ts.requests;
     st.tr_failures = ts.failures;
     st.tr_cache_hits = ts.cache_hits;
     st.tr_tokens = ts.prompt_tokens + ts.completion_tokens;
     st.tr_in_flight = app.translator.in_flight();
-    st.tr_last_error = ts.last_error.map(|e| format!("{} ({})", truncate_chars(&e, 200), fmt_relative(ts.last_error_at)));
-    render(DashboardT { base: base(&s, "dash", &q), s: st, stages, events })
+    // Health reflects the latest outcome, not just whether the circuit is open: a
+    // service that fails every request must not show as "正常".
+    let failing = ts.last_error_at.is_some_and(|e| ts.last_success_at.is_none_or(|ok| e > ok));
+    (st.tr_state, st.tr_state_label) = match &st.tr_circuit {
+        Some(c) => ("err", format!("已暂停 · {c}后自动重试")),
+        None if failing => ("err", "最近请求失败".into()),
+        None if ts.requests == 0 => ("idle", "待命".into()),
+        None => ("ok", "正常".into()),
+    };
+    let show_error = failing || st.tr_circuit.is_some();
+    st.tr_last_error = ts.last_error.filter(|_| show_error).map(|e| format!("{}（{}）", truncate_chars(&e, 240), fmt_relative(ts.last_error_at)));
+    st.tr_hint = ts.last_error_hint.filter(|_| show_error);
+    let queue_total: i64 = stages.iter().map(|r| r.due + r.waiting).sum();
+    let max = stages.iter().map(|r| r.due + r.waiting).max().unwrap_or(0).max(1);
+    for r in &mut stages {
+        r.due_pct = (r.due * 100 + max - 1) / max;
+        r.wait_pct = (r.waiting * 100 + max - 1) / max;
+    }
+    render(DashboardT { base: base(&s, "dash", &q), s: st, stages, queue_total, events })
 }
 
 fn stage_name(s: &str) -> &'static str {
@@ -451,15 +537,22 @@ fn stage_name(s: &str) -> &'static str {
 struct FeedListRow {
     id: i64,
     title: String,
+    initial: String,
+    has_icon: bool,
     url: String,
     category: String,
     enabled: bool,
     badges: Vec<&'static str>,
     unread: i64,
     items: i64,
-    last_fetch: String,
+    last_fetch: Ts,
     error: String,
     error_count: i64,
+}
+
+/// First letter for the placeholder avatar of a feed without an icon.
+fn initial(title: &str) -> String {
+    title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "#".into())
 }
 
 struct CatOption {
@@ -473,6 +566,7 @@ struct FeedsT {
     base: Base,
     feeds: Vec<FeedListRow>,
     categories: Vec<CatOption>,
+    errors: usize,
 }
 
 pub fn option_badges(o: &FeedOptions) -> Vec<&'static str> {
@@ -509,29 +603,33 @@ async fn feeds_page(State(app): State<AppRef>, headers: HeaderMap, Query(q): Que
                 st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
             };
             let mut st = c.prepare(
-                "SELECT f.id, f.title, f.url, COALESCE(c.name, ''), f.enabled, f.options, f.last_fetch_at, COALESCE(f.last_error, ''), f.fetch_error_count
+                "SELECT f.id, f.title, f.url, COALESCE(c.name, ''), f.enabled, f.options, f.last_fetch_at, COALESCE(f.last_error, ''), f.fetch_error_count,
+                        EXISTS (SELECT 1 FROM feed_icons fi WHERE fi.feed_id = f.id AND length(fi.data) > 0)
                  FROM feeds f LEFT JOIN categories c ON c.id = f.category_id ORDER BY c.name COLLATE NOCASE, f.title COLLATE NOCASE",
             )?;
             let rows = st
                 .query_map([], |r| {
                     let id: i64 = r.get(0)?;
                     let opts = FeedOptions::from_json(&r.get::<_, String>(5)?);
+                    let title: String = r.get(1)?;
                     Ok(FeedListRow {
                         id,
-                        title: r.get(1)?,
+                        initial: initial(&title),
+                        title,
+                        has_icon: r.get::<_, i64>(9)? != 0,
                         url: r.get(2)?,
                         category: r.get(3)?,
                         enabled: r.get::<_, i64>(4)? != 0,
                         badges: option_badges(&opts),
                         unread: 0,
                         items: 0,
-                        last_fetch: fmt_relative(r.get(6)?),
+                        last_fetch: Ts::rel(r.get(6)?),
                         error: r.get(7)?,
                         error_count: r.get(8)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            let rows = rows
+            let rows: Vec<FeedListRow> = rows
                 .into_iter()
                 .map(|mut f| {
                     f.unread = unread.get(&f.id).copied().unwrap_or(0);
@@ -544,7 +642,10 @@ async fn feeds_page(State(app): State<AppRef>, headers: HeaderMap, Query(q): Que
         })
         .await;
     match res {
-        Ok((feeds, categories)) => render(FeedsT { base: base(&s, "feeds", &q), feeds, categories }),
+        Ok((feeds, categories)) => {
+            let errors = feeds.iter().filter(|f| f.error_count > 0).count();
+            render(FeedsT { base: base(&s, "feeds", &q), feeds, categories, errors })
+        }
         Err(e) => server_error(e),
     }
 }
@@ -587,13 +688,18 @@ async fn feeds_refresh_all(State(app): State<AppRef>, headers: HeaderMap, body: 
 struct FeedDetail {
     id: i64,
     title: String,
+    initial: String,
+    has_icon: bool,
+    enabled: bool,
     url: String,
     site_url: String,
     unread: i64,
     items: i64,
     stories: i64,
     versions: i64,
-    last_fetch: String,
+    pending: i64,
+    failed: i64,
+    last_fetch: Ts,
     next_fetch: String,
     last_status: String,
     duration: String,
@@ -608,6 +714,7 @@ struct FeedT {
     feed: FeedDetail,
     sections: Vec<Section>,
     events: Vec<EventRow>,
+    scopes: &'static [(&'static str, &'static str)],
 }
 
 fn field(name: &str, label: &str, kind: &'static str, value: impl ToString, help: &str) -> Field {
@@ -750,13 +857,18 @@ async fn feed_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
             let detail = FeedDetail {
                 id,
                 title: f.title.clone(),
+                initial: initial(&f.title),
+                has_icon: one("SELECT EXISTS (SELECT 1 FROM feed_icons WHERE feed_id = ? AND length(data) > 0)")? != 0,
+                enabled: enabled != 0,
                 url: f.url.clone(),
                 site_url: site.unwrap_or_default(),
                 unread: one("SELECT COUNT(*) FROM items WHERE feed_id = ? AND is_read = 0 AND hidden = 0")?,
                 items: one("SELECT COUNT(*) FROM items WHERE feed_id = ?")?,
                 stories: one("SELECT COUNT(*) FROM stories WHERE feed_id = ?")?,
-                versions: one("SELECT COUNT(*) FROM items WHERE feed_id = ? AND version > 1")?,
-                last_fetch: fmt_relative(last_fetch),
+                versions: one("SELECT COUNT(*) FROM revisions WHERE feed_id = ? AND state = 'published' AND reason IN ('entry_update', 'page_update')")?,
+                pending: one("SELECT COUNT(*) FROM revisions WHERE feed_id = ? AND state = 'pending'")?,
+                failed: one("SELECT COUNT(*) FROM revisions WHERE feed_id = ? AND state = 'failed'")?,
+                last_fetch: Ts::rel(last_fetch),
                 next_fetch: if enabled == 0 { "已停用".into() } else { fmt_relative(Some(next_fetch.max(1))) },
                 last_status: status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
                 duration: dur.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
@@ -765,12 +877,12 @@ async fn feed_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
             };
             let cats: Vec<CatOption> = crate::store::list_categories(c)?.into_iter().map(|c| CatOption { id: c.id, name: c.name }).collect();
             let sections = feed_sections(&f, enabled != 0, category, &cats, interval);
-            let events = load_events(c, Some(id), "", "", 30)?;
+            let events = load_events(c, Some(id), "", "", 12)?;
             Ok(Some((detail, sections, events)))
         })
         .await;
     match res {
-        Ok(Some((feed, sections, events))) => render(FeedT { base: base(&s, "feeds", &q), feed, sections, events }),
+        Ok(Some((feed, sections, events))) => render(FeedT { base: base(&s, "feeds", &q), feed, sections, events, scopes: REPROCESS_SCOPES }),
         Ok(None) => (StatusCode::NOT_FOUND, "feed not found").into_response(),
         Err(e) => server_error(e),
     }
@@ -883,7 +995,7 @@ async fn feed_save(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
         })
         .await;
     match res {
-        Ok(_) => redirect_msg(&format!("/admin/feeds/{id}"), "已保存。新设置对之后处理的文章生效；可用「重新处理」更新已有文章。"),
+        Ok(_) => redirect_msg(&format!("/admin/feeds/{id}"), "已保存。新设置对之后抓取的文章生效；已发布的文章可用「重新处理」按新设置更新。"),
         Err(e) => redirect_err(&format!("/admin/feeds/{id}"), &format!("保存失败：{e:#}")),
     }
 }
@@ -904,29 +1016,39 @@ async fn feed_refresh(State(app): State<AppRef>, headers: HeaderMap, Path(id): P
     }
 }
 
+/// Scopes offered for reprocessing (value understood by `ReprocessScope::parse`).
+pub const REPROCESS_SCOPES: &[(&str, &str)] = &[
+    ("n10", "最近 10 篇"),
+    ("n50", "最近 50 篇"),
+    ("n200", "最近 200 篇"),
+    ("n1000", "最近 1000 篇"),
+    ("d1", "最近 1 天"),
+    ("d7", "最近 7 天"),
+    ("d30", "最近 30 天"),
+    ("all", "全部文章"),
+];
+
+async fn reprocess(app: &AppRef, feed: Option<i64>, form: &Form, back: &str) -> Response {
+    let scope = crate::pipeline::ReprocessScope::parse(form.get("scope").unwrap_or("n10"));
+    let unread_only = form.get("unread_only").is_some();
+    match crate::pipeline::reprocess_published(app, feed, scope, unread_only).await {
+        Ok(0) => redirect_err(back, "没有符合条件的文章。"),
+        Ok(n) => redirect_msg(back, &format!("已安排重新处理 {n} 篇文章。完成后以新版本发布，保留已读与收藏状态；进度可在「任务」页查看。")),
+        Err(e) => server_error(e),
+    }
+}
+
 async fn feed_reprocess(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path<i64>, body: Bytes) -> Response {
     let form = Form::parse(&body);
     let _s = guard_post!(app, headers, form);
-    let limit: i64 = form.get("limit").and_then(|l| l.parse().ok()).unwrap_or(10).clamp(1, 200);
-    let stories: Vec<i64> = match app
-        .db
-        .call(move |c| {
-            let mut st = c.prepare("SELECT id FROM stories WHERE feed_id = ? AND state <> 'skipped' ORDER BY first_seen_at DESC LIMIT ?")?;
-            let v = st.query_map(params![id, limit], |r| r.get(0))?.collect::<Result<Vec<i64>, _>>()?;
-            Ok(v)
-        })
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return server_error(e),
-    };
-    let mut n = 0;
-    for sid in stories {
-        if crate::pipeline::reprocess_story(&app, sid).await.unwrap_or(false) {
-            n += 1;
-        }
-    }
-    redirect_msg(&format!("/admin/feeds/{id}"), &format!("已安排重新处理 {n} 篇文章。"))
+    reprocess(&app, Some(id), &form, &format!("/admin/feeds/{id}")).await
+}
+
+async fn bulk_reprocess(State(app): State<AppRef>, headers: HeaderMap, body: Bytes) -> Response {
+    let form = Form::parse(&body);
+    let _s = guard_post!(app, headers, form);
+    let feed = form.get("feed").and_then(|f| f.parse::<i64>().ok());
+    reprocess(&app, feed, &form, "/admin/tasks").await
 }
 
 async fn feed_markread(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path<i64>, body: Bytes) -> Response {
@@ -1032,13 +1154,16 @@ async fn category_delete(State(app): State<AppRef>, headers: HeaderMap, Path(id)
 struct ItemRowV {
     id: i64,
     title: String,
+    feed_id: i64,
     feed: String,
+    feed_initial: String,
+    has_icon: bool,
     version: i64,
     superseded_by: Option<i64>,
     read: bool,
     starred: bool,
-    published: String,
-    created: String,
+    published: Ts,
+    created: Ts,
 }
 
 #[derive(Template)]
@@ -1074,7 +1199,8 @@ async fn items_page(State(app): State<AppRef>, headers: HeaderMap, Query(iq): Qu
         .db
         .call(move |c| {
             let mut sql = String::from(
-                "SELECT i.id, i.title, f.title, i.version, i.superseded_by, i.is_read, i.is_starred, i.published_at, i.created_at
+                "SELECT i.id, i.title, f.title, i.version, i.superseded_by, i.is_read, i.is_starred, i.published_at, i.created_at, f.id,
+                        EXISTS (SELECT 1 FROM feed_icons fi WHERE fi.feed_id = f.id AND length(fi.data) > 0)
                  FROM items i JOIN feeds f ON f.id = i.feed_id WHERE 1",
             );
             let mut p: Vec<rusqlite::types::Value> = Vec::new();
@@ -1100,16 +1226,20 @@ async fn items_page(State(app): State<AppRef>, headers: HeaderMap, Query(iq): Qu
             let mut st = c.prepare(&sql)?;
             let items = st
                 .query_map(rusqlite::params_from_iter(p), |r| {
+                    let feed: String = r.get(2)?;
                     Ok(ItemRowV {
                         id: r.get(0)?,
                         title: r.get(1)?,
-                        feed: r.get(2)?,
+                        feed_initial: initial(&feed),
+                        feed,
                         version: r.get(3)?,
                         superseded_by: r.get(4)?,
                         read: r.get::<_, i64>(5)? != 0,
                         starred: r.get::<_, i64>(6)? != 0,
-                        published: fmt_ts(r.get(7)?).replace(" UTC", ""),
-                        created: fmt_ts(Some(r.get::<_, i64>(8)? / 1_000_000)).replace(" UTC", ""),
+                        published: Ts::abs(r.get(7)?),
+                        created: Ts::abs(Some(r.get::<_, i64>(8)? / 1_000_000)),
+                        feed_id: r.get(9)?,
+                        has_icon: r.get::<_, i64>(10)? != 0,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1144,11 +1274,14 @@ async fn items_page(State(app): State<AppRef>, headers: HeaderMap, Query(iq): Qu
 struct ItemDetail {
     id: i64,
     title: String,
+    feed_id: i64,
     feed: String,
     link: String,
     version: i64,
-    published: String,
-    created: String,
+    read: bool,
+    starred: bool,
+    published: Ts,
+    created: Ts,
     superseded_by: Option<i64>,
     story_id: Option<i64>,
     content: String,
@@ -1158,20 +1291,21 @@ struct VersionRow {
     id: i64,
     version: i64,
     title: String,
-    created: String,
+    created: Ts,
     read: bool,
     starred: bool,
 }
 
 struct RevRow {
     id: i64,
-    reason: String,
-    state: String,
-    stage: String,
+    reason: &'static str,
+    state: &'static str,
+    state_class: &'static str,
+    stage: &'static str,
     attempts: i64,
     notes: String,
     error: String,
-    updated: String,
+    updated: Ts,
 }
 
 #[derive(Template)]
@@ -1190,15 +1324,15 @@ async fn item_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
         .db
         .call(move |c| {
             #[allow(clippy::type_complexity)]
-            let row: Option<(String, String, Option<String>, i64, i64, i64, Option<i64>, Option<i64>, String)> = c
+            let row: Option<(String, String, Option<String>, i64, i64, i64, Option<i64>, Option<i64>, String, i64, i64, i64)> = c
                 .query_row(
-                    "SELECT i.title, f.title, i.link, i.version, i.published_at, i.created_at, i.superseded_by, i.story_id, i.content
+                    "SELECT i.title, f.title, i.link, i.version, i.published_at, i.created_at, i.superseded_by, i.story_id, i.content, f.id, i.is_read, i.is_starred
                      FROM items i JOIN feeds f ON f.id = i.feed_id WHERE i.id = ?",
                     [id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?)),
                 )
                 .optional()?;
-            let Some((title, feed, link, version, published, created, sup, story, content)) = row else { return Ok(None) };
+            let Some((title, feed, link, version, published, created, sup, story, content, feed_id, read, starred)) = row else { return Ok(None) };
             let mut versions = Vec::new();
             let mut revisions = Vec::new();
             if let Some(sid) = story {
@@ -1209,7 +1343,7 @@ async fn item_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
                             id: r.get(0)?,
                             version: r.get(1)?,
                             title: r.get(2)?,
-                            created: fmt_ts(Some(r.get::<_, i64>(3)? / 1_000_000)),
+                            created: Ts::abs(Some(r.get::<_, i64>(3)? / 1_000_000)),
                             read: r.get::<_, i64>(4)? != 0,
                             starred: r.get::<_, i64>(5)? != 0,
                         })
@@ -1219,15 +1353,26 @@ async fn item_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
                 revisions = st
                     .query_map([sid], |r| {
                         let notes: Vec<String> = serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default();
+                        let state: String = r.get(2)?;
+                        let (state, state_class) = match state.as_str() {
+                            "published" => ("已发布", "ok"),
+                            "unchanged" => ("无变化", ""),
+                            "pending" => ("处理中", "accent"),
+                            "failed" => ("失败", "err"),
+                            "obsolete" => ("已取代", ""),
+                            "skipped" => ("已跳过", ""),
+                            _ => ("其他", ""),
+                        };
                         Ok(RevRow {
                             id: r.get(0)?,
-                            reason: r.get(1)?,
-                            state: r.get(2)?,
-                            stage: r.get(3)?,
+                            reason: reason_label(&r.get::<_, String>(1)?),
+                            state,
+                            state_class,
+                            stage: stage_name(&r.get::<_, String>(3)?),
                             attempts: r.get(4)?,
                             notes: notes.join("；"),
                             error: r.get(6)?,
-                            updated: fmt_ts(r.get(7)?),
+                            updated: Ts::rel(r.get(7)?),
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1236,11 +1381,14 @@ async fn item_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
                 ItemDetail {
                     id,
                     title,
+                    feed_id,
                     feed,
                     link: link.unwrap_or_default(),
                     version,
-                    published: fmt_ts(Some(published)),
-                    created: fmt_ts(Some(created / 1_000_000)),
+                    read: read != 0,
+                    starred: starred != 0,
+                    published: Ts::abs(Some(published)),
+                    created: Ts::abs(Some(created / 1_000_000)),
                     superseded_by: sup,
                     story_id: story,
                     content,
@@ -1263,9 +1411,10 @@ async fn item_page(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path
 async fn story_reprocess(State(app): State<AppRef>, headers: HeaderMap, Path(id): Path<i64>, body: Bytes) -> Response {
     let form = Form::parse(&body);
     let _s = guard_post!(app, headers, form);
+    let back = form.get("item").and_then(|i| i.parse::<i64>().ok()).map(|i| format!("/admin/items/{i}")).unwrap_or_else(|| "/admin/tasks".into());
     match crate::pipeline::reprocess_story(&app, id).await {
-        Ok(true) => redirect_msg("/admin/tasks", "已安排重新处理，完成后会以新版本发布。"),
-        Ok(false) => redirect_err("/admin/tasks", "没有可重新处理的源数据。"),
+        Ok(true) => redirect_msg(&back, "已安排重新处理，完成后以新版本发布（保留已读与收藏状态）。"),
+        Ok(false) => redirect_err(&back, "没有可重新处理的源数据。"),
         Err(e) => server_error(e),
     }
 }
@@ -1279,10 +1428,10 @@ struct TaskRow {
     feed_id: i64,
     feed: String,
     title: String,
-    reason: String,
-    stage: String,
+    reason: &'static str,
+    stage: &'static str,
     attempts: i64,
-    next: String,
+    next: Ts,
     error: String,
 }
 
@@ -1291,8 +1440,12 @@ struct TaskRow {
 struct TasksT {
     base: Base,
     pending: Vec<TaskRow>,
+    pending_total: i64,
     failed: Vec<TaskRow>,
+    failed_total: i64,
     feed_errors: Vec<(i64, String, i64, String, String)>,
+    feeds: Vec<(i64, String)>,
+    scopes: &'static [(&'static str, &'static str)],
 }
 
 async fn tasks_page(State(app): State<AppRef>, headers: HeaderMap, Query(q): Query<FlashQuery>) -> Response {
@@ -1300,42 +1453,67 @@ async fn tasks_page(State(app): State<AppRef>, headers: HeaderMap, Query(q): Que
     let res = app
         .db
         .call(|c| {
-            let load = |sql: &str| -> rusqlite::Result<Vec<TaskRow>> {
+            let now = util::now();
+            let load = |sql: &str, pending: bool| -> rusqlite::Result<Vec<TaskRow>> {
                 let mut st = c.prepare(sql)?;
                 st.query_map([], |r| {
                     let reason: String = r.get(4)?;
                     let stage: String = r.get(5)?;
+                    let at: Option<i64> = r.get(7)?;
                     Ok(TaskRow {
                         id: r.get(0)?,
                         feed_id: r.get(1)?,
                         feed: r.get(2)?,
                         title: r.get(3)?,
-                        reason,
-                        stage: stage_name(&stage).to_string(),
+                        reason: reason_label(&reason),
+                        stage: stage_name(&stage),
                         attempts: r.get(6)?,
-                        next: fmt_relative(r.get(7)?),
+                        next: match at {
+                            Some(-1) if pending => Ts { iso: String::new(), text: "进行中".into() },
+                            t if pending && t.is_none_or(|t| t <= now) => Ts { iso: String::new(), text: "排队中".into() },
+                            t => Ts::rel(t),
+                        },
                         error: truncate_chars(&r.get::<_, Option<String>>(8)?.unwrap_or_default(), 300),
                     })
                 })?
                 .collect()
             };
             let pending = load(
-                "SELECT r.id, r.feed_id, f.title, r.title, r.reason, r.stage, r.attempts, r.next_attempt_at, r.last_error
-                 FROM revisions r JOIN feeds f ON f.id = r.feed_id WHERE r.state = 'pending' ORDER BY r.next_attempt_at, r.id LIMIT 200",
+                "SELECT r.id, r.feed_id, f.title, r.title, r.reason, r.stage, r.attempts,
+                        CASE WHEN r.lease_until > strftime('%s','now') THEN -1 ELSE r.next_attempt_at END, r.last_error
+                 FROM revisions r JOIN feeds f ON f.id = r.feed_id WHERE r.state = 'pending'
+                 ORDER BY (r.lease_until > strftime('%s','now')) DESC, r.next_attempt_at, r.priority DESC, r.id LIMIT 200",
+                true,
             )?;
             let failed = load(
                 "SELECT r.id, r.feed_id, f.title, r.title, r.reason, r.stage, r.attempts, r.updated_at, r.last_error
                  FROM revisions r JOIN feeds f ON f.id = r.feed_id WHERE r.state = 'failed' ORDER BY r.id DESC LIMIT 100",
+                false,
             )?;
             let mut st = c.prepare("SELECT id, title, fetch_error_count, COALESCE(last_error, ''), next_fetch_at FROM feeds WHERE fetch_error_count > 0 ORDER BY fetch_error_count DESC")?;
             let feed_errors = st
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, fmt_relative(Some(r.get::<_, i64>(4)?)))))?
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok((pending, failed, feed_errors))
+            let pending_total: i64 = c.query_row("SELECT COUNT(*) FROM revisions WHERE state = 'pending'", [], |r| r.get(0))?;
+            let failed_total: i64 = c.query_row("SELECT COUNT(*) FROM revisions WHERE state = 'failed'", [], |r| r.get(0))?;
+            let feeds: Vec<(i64, String)> = {
+                let mut st = c.prepare("SELECT id, title FROM feeds ORDER BY title COLLATE NOCASE")?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+            };
+            Ok((pending, pending_total, failed, failed_total, feed_errors, feeds))
         })
         .await;
     match res {
-        Ok((pending, failed, feed_errors)) => render(TasksT { base: base(&s, "tasks", &q), pending, failed, feed_errors }),
+        Ok((pending, pending_total, failed, failed_total, feed_errors, feeds)) => render(TasksT {
+            base: base(&s, "tasks", &q),
+            pending,
+            pending_total,
+            failed,
+            failed_total,
+            feed_errors,
+            feeds,
+            scopes: REPROCESS_SCOPES,
+        }),
         Err(e) => server_error(e),
     }
 }
@@ -1369,6 +1547,7 @@ struct EventsT {
     events: Vec<EventRow>,
     level: String,
     kind: String,
+    kinds: &'static [(&'static str, &'static str)],
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1383,7 +1562,7 @@ async fn events_page(State(app): State<AppRef>, headers: HeaderMap, Query(eq): Q
     let kind = eq.kind.unwrap_or_default();
     let (l2, k2) = (level.clone(), kind.clone());
     match app.db.call(move |c| load_events(c, None, &l2, &k2, 300)).await {
-        Ok(events) => render(EventsT { base: base(&s, "events", &FlashQuery::default()), events, level, kind }),
+        Ok(events) => render(EventsT { base: base(&s, "events", &FlashQuery::default()), events, level, kind, kinds: EVENT_KINDS }),
         Err(e) => server_error(e),
     }
 }
@@ -1555,7 +1734,7 @@ async fn settings_save(State(app): State<AppRef>, headers: HeaderMap, body: Byte
             app.translator.reset_circuit();
             app.wake_fetcher.notify_one();
             app.wake_pipeline.notify_one();
-            redirect_msg("/admin/settings", "设置已保存并立即生效。")
+            redirect_msg("/admin/settings", "设置已保存并立即生效。已发布的文章不会自动改变，可在「任务」页按订阅批量重新处理。")
         }
         Err(e) => server_error(e),
     }
@@ -1571,6 +1750,7 @@ struct ToolsT {
     base: Base,
     extract_url: String,
     translate_text: String,
+    result_err: bool,
     result_title: String,
     result_meta: String,
     result_html: String,
@@ -1581,6 +1761,7 @@ fn tools(s: &Session) -> ToolsT {
         base: base(s, "tools", &FlashQuery::default()),
         extract_url: String::new(),
         translate_text: "<p>The prime minister said on <b>Monday</b> that taxes would rise next year.</p><p>Opposition parties criticised the plan.</p>".into(),
+        result_err: false,
         result_title: String::new(),
         result_meta: String::new(),
         result_html: String::new(),
@@ -1633,6 +1814,7 @@ async fn tool_extract(State(app): State<AppRef>, headers: HeaderMap, body: Bytes
             t.result_html = clean;
         }
         Err(crate::pipeline::PageError::Transient(e)) | Err(crate::pipeline::PageError::Permanent(e)) => {
+            t.result_err = true;
             t.result_title = "提取失败".into();
             t.result_meta = e;
         }
@@ -1653,6 +1835,7 @@ async fn tool_translate(State(app): State<AppRef>, headers: HeaderMap, body: Byt
     let started = std::time::Instant::now();
     match app.translator.test(&settings.translation, &target, &sanitize::sanitize(&html, None)).await {
         Ok(r) => {
+            t.result_err = !r.complete;
             t.result_title = if r.complete { "翻译成功".into() } else { "翻译不完整".into() };
             t.result_meta = format!(
                 "耗时 {} ms，请求 {} 次，段落 {}，缓存命中 {}，失败 {}，降级 {}\n标题：{}{}",
@@ -1668,8 +1851,14 @@ async fn tool_translate(State(app): State<AppRef>, headers: HeaderMap, body: Byt
             t.result_html = r.html;
         }
         Err(e) => {
+            t.result_err = true;
             t.result_title = "翻译失败".into();
             t.result_meta = e.to_string();
+            if let crate::content::translate::TranslateError::Api(api) = &e
+                && let Some(h) = api.hint()
+            {
+                t.result_meta.push_str(&format!("\n\n{h}"));
+            }
         }
     }
     render(t)
@@ -1686,6 +1875,7 @@ async fn tool_feed(State(app): State<AppRef>, headers: HeaderMap, body: Bytes) -
             t.result_meta = format!("订阅地址：{}\n标题：{}", d.url, d.title);
         }
         Err(e) => {
+            t.result_err = true;
             t.result_title = "检测失败".into();
             t.result_meta = format!("{e:#}");
         }

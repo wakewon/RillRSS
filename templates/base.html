@@ -4,35 +4,80 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
 <title>{% block title %}RillRSS{% endblock %} · RillRSS</title>
-<link rel="stylesheet" href="/admin/static/admin.css?v={{ base.version }}">
+<script>try{var t=localStorage.getItem('rill-theme');if(t){document.documentElement.setAttribute('data-theme',t)}}catch(e){}</script>
+<style>{{ base.css|safe }}</style>
 </head>
 <body>
-<header class="top">
-  <a class="brand" href="/admin">RillRSS</a>
-  <nav>
-    <a href="/admin" class="{% if base.nav == "dash" %}on{% endif %}">概览</a>
-    <a href="/admin/feeds" class="{% if base.nav == "feeds" %}on{% endif %}">订阅</a>
-    <a href="/admin/items" class="{% if base.nav == "items" %}on{% endif %}">文章</a>
-    <a href="/admin/tasks" class="{% if base.nav == "tasks" %}on{% endif %}">任务</a>
-    <a href="/admin/events" class="{% if base.nav == "events" %}on{% endif %}">日志</a>
-    <a href="/admin/settings" class="{% if base.nav == "settings" %}on{% endif %}">设置</a>
-    <a href="/admin/tools" class="{% if base.nav == "tools" %}on{% endif %}">工具</a>
-    <a href="/admin/account" class="{% if base.nav == "account" %}on{% endif %}">账户</a>
-  </nav>
-  <form method="post" action="/admin/logout" class="logout"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="link">退出</button></form>
-</header>
-<main>
-{% if let Some(msg) = base.flash %}<div class="flash">{{ msg }}</div>{% endif %}
-{% if let Some(err) = base.error %}<div class="flash err">{{ err }}</div>{% endif %}
-{% block content %}{% endblock %}
-</main>
-<footer>RillRSS {{ base.version }}</footer>
+{% include "icons.html" %}
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="/admin" aria-label="RillRSS"><span class="logo"><svg viewBox="0 0 24 24"><path d="M3.5 9c2.8-2.6 5.7 2.6 8.5 0s5.7 2.6 8.5 0"/><path d="M3.5 15c2.8-2.6 5.7 2.6 8.5 0s5.7 2.6 8.5 0"/></svg></span><span class="brand-name">RillRSS</span></a>
+    <nav class="nav">
+      <a href="/admin" class="{% if base.nav == "dash" %}on{% endif %}"><svg class="icon"><use href="#i-home"/></svg>概览</a>
+      <a href="/admin/feeds" class="{% if base.nav == "feeds" %}on{% endif %}"><svg class="icon"><use href="#i-rss"/></svg>订阅</a>
+      <a href="/admin/items" class="{% if base.nav == "items" %}on{% endif %}"><svg class="icon"><use href="#i-file"/></svg>文章</a>
+      <a href="/admin/tasks" class="{% if base.nav == "tasks" %}on{% endif %}"><svg class="icon"><use href="#i-activity"/></svg>任务</a>
+      <a href="/admin/events" class="{% if base.nav == "events" %}on{% endif %}"><svg class="icon"><use href="#i-list"/></svg>日志</a>
+      <div class="sep"></div>
+      <a href="/admin/settings" class="{% if base.nav == "settings" %}on{% endif %}"><svg class="icon"><use href="#i-sliders"/></svg>设置</a>
+      <a href="/admin/tools" class="{% if base.nav == "tools" %}on{% endif %}"><svg class="icon"><use href="#i-tool"/></svg>工具</a>
+      <a href="/admin/account" class="{% if base.nav == "account" %}on{% endif %}"><svg class="icon"><use href="#i-user"/></svg>账户</a>
+    </nav>
+    <div class="side-foot">
+      <span class="ver">v{{ base.version }}</span>
+      <button class="icon-btn" type="button" id="theme-btn" title="切换浅色 / 深色"><svg class="icon sm"><use href="#i-theme"/></svg></button>
+      <form method="post" action="/admin/logout" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="icon-btn" title="退出登录"><svg class="icon sm"><use href="#i-logout"/></svg></button></form>
+    </div>
+  </aside>
+  <main class="main"><div class="content">
+    {% if let Some(msg) = base.flash %}<div class="flash" role="status"><svg class="icon"><use href="#i-check"/></svg><div>{{ msg }}</div></div>{% endif %}
+    {% if let Some(err) = base.error %}<div class="flash err" role="alert"><svg class="icon"><use href="#i-alert"/></svg><div>{{ err }}</div></div>{% endif %}
+    {% block content %}{% endblock %}
+  </div></main>
+</div>
 <script>
 document.addEventListener('submit', function (e) {
-  var f = e.target; var q = f.getAttribute('data-confirm');
+  var q = e.target.getAttribute('data-confirm');
   if (q && !window.confirm(q)) { e.preventDefault(); }
 });
+document.addEventListener('click', function (e) {
+  var b = e.target.closest('[data-copy]');
+  if (!b) return;
+  var text = b.getAttribute('data-copy');
+  var done = function () { var old = b.innerHTML; b.textContent = '已复制'; setTimeout(function () { b.innerHTML = old; }, 1200); };
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(done); }
+  else { var t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select(); try { document.execCommand('copy'); done(); } catch (err) {} t.remove(); }
+});
+// Drop the one-shot ?msg= / ?err= so a reload does not repeat the notice.
+(function () {
+  if (!/[?&](msg|err)=/.test(location.search) || !window.URLSearchParams) return;
+  var q = new URLSearchParams(location.search); q.delete('msg'); q.delete('err');
+  var rest = q.toString();
+  try { history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash); } catch (e) {}
+})();
+(function () {
+  var pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+  var year = new Date().getFullYear();
+  document.querySelectorAll('time[datetime]').forEach(function (t) {
+    var v = t.getAttribute('datetime'); if (!v) return;
+    var d = new Date(v); if (isNaN(d.getTime())) return;
+    var day = pad(d.getMonth() + 1) + '-' + pad(d.getDate()), hm = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    t.title = d.getFullYear() + '-' + day + ' ' + hm + ':' + pad(d.getSeconds());
+    if (t.hasAttribute('data-local')) { t.textContent = (d.getFullYear() === year ? '' : d.getFullYear() + '-') + day + ' ' + hm; }
+  });
+})();
+(function () {
+  var btn = document.getElementById('theme-btn'); if (!btn) return;
+  btn.addEventListener('click', function () {
+    var root = document.documentElement;
+    var dark = root.getAttribute('data-theme') ? root.getAttribute('data-theme') === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var next = dark ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('rill-theme', next); } catch (e) {}
+  });
+})();
 </script>
 </body>
 </html>

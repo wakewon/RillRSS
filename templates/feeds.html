@@ -1,15 +1,23 @@
 {% extends "base.html" %}
 {% block title %}订阅{% endblock %}
 {% block content %}
-<h1>订阅</h1>
+<div class="page-head">
+  <div><h1>订阅</h1><div class="sub">{{ feeds.len() }} 个订阅{% if errors > 0 %} · <span class="err">{{ errors }} 个抓取出错</span>{% endif %}</div></div>
+  <div class="actions">
+    <a class="btn" href="/admin/opml"><svg class="icon sm"><use href="#i-upload"/></svg>OPML</a>
+    <a class="btn" href="/admin/categories"><svg class="icon sm"><use href="#i-folder"/></svg>分类</a>
+    <form method="post" action="/admin/feeds/refresh-all" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="btn"><svg class="icon sm"><use href="#i-refresh"/></svg>全部刷新</button></form>
+  </div>
+</div>
+
 <div class="card">
   <form method="post" action="/admin/feeds">
     <input type="hidden" name="csrf" value="{{ base.csrf }}">
-    <div class="row">
-      <div><label for="add_url">订阅地址（RSS/Atom/JSON Feed 或网页地址）</label><input type="url" id="add_url" name="url" required placeholder="https://example.com/feed.xml"></div>
-      <div class="shrink" style="min-width:150px"><label for="add_cat">分类</label>
-        <select id="add_cat" name="category"><option value="">（未分类）</option>{% for c in categories %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div>
-      <div class="shrink" style="min-width:180px"><label for="add_preset">预设</label>
+    <div class="form-row">
+      <div class="field grow"><label for="add_url">添加订阅</label><input type="url" id="add_url" name="url" required placeholder="RSS / Atom / JSON Feed 地址，或网站首页"></div>
+      <div class="field fixed" style="width:160px"><label for="add_cat">分类</label>
+        <select id="add_cat" name="category"><option value="">未分类</option>{% for c in categories %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div>
+      <div class="field fixed" style="width:180px"><label for="add_preset">处理方式</label>
         <select id="add_preset" name="preset">
           <option value="plain">仅订阅</option>
           <option value="fulltext">全文提取</option>
@@ -17,29 +25,36 @@
           <option value="tr">翻译</option>
           <option value="t2s">繁转简 + 图片缓存</option>
         </select></div>
-      <div class="shrink"><button>添加</button></div>
+      <div class="fixed"><button class="btn primary"><svg class="icon sm"><use href="#i-plus"/></svg>添加</button></div>
     </div>
-    <div class="help">添加后可在订阅详情页调整全文提取、繁简转换、翻译、图片缓存与更新追踪等选项。</div>
   </form>
 </div>
-<div class="actions">
-  <form method="post" action="/admin/feeds/refresh-all" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="secondary">全部刷新</button></form>
-  <a class="btn secondary" href="/admin/categories">管理分类</a>
-  <a class="btn secondary" href="/admin/opml">OPML 导入/导出</a>
+
+<div class="card flush">
+{% if feeds.is_empty() %}
+  <div class="empty"><svg class="icon"><use href="#i-rss"/></svg><div>还没有订阅</div><div class="small">在上方添加订阅地址，或 <a href="/admin/opml">导入 OPML</a>。</div></div>
+{% else %}
+  <div class="table-wrap"><table>
+  <thead><tr><th>名称</th><th class="hide-sm">分类</th><th class="hide-sm">处理</th><th class="num">未读</th><th class="num hide-sm">文章</th><th class="hide-sm">上次抓取</th><th>状态</th></tr></thead>
+  <tbody>
+  {% for f in feeds %}
+  <tr>
+    <td class="fill">
+      <div class="cell-title">
+        {% if f.has_icon %}<img class="favicon" src="/feed-icons/{{ f.id }}.ico" alt="" loading="lazy">{% else %}<span class="favicon letter">{{ f.initial }}</span>{% endif %}
+        <div style="min-width:0"><a class="t ellipsis" style="display:block" href="/admin/feeds/{{ f.id }}">{{ f.title }}</a><div class="sub ellipsis">{{ f.url }}</div></div>
+      </div>
+    </td>
+    <td class="hide-sm text-2">{{ f.category }}</td>
+    <td class="hide-sm"><div class="badges">{% for b in f.badges %}<span class="badge accent">{{ b }}</span>{% endfor %}</div></td>
+    <td class="num">{% if f.unread > 0 %}<b>{{ f.unread }}</b>{% else %}<span class="muted">0</span>{% endif %}</td>
+    <td class="num hide-sm text-2">{{ f.items }}</td>
+    <td class="hide-sm small text-2 nowrap"><time datetime="{{ f.last_fetch.iso }}">{{ f.last_fetch.text }}</time></td>
+    <td class="nowrap">{% if !f.enabled %}<span class="status"><span class="dot"></span>已停用</span>{% else if f.error_count > 0 %}<span class="status err" title="{{ f.error }}"><span class="dot err"></span>失败 ×{{ f.error_count }}</span>{% else %}<span class="status ok"><span class="dot ok"></span>正常</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+  </table></div>
+{% endif %}
 </div>
-<div class="table-wrap"><table>
-<tr><th>名称</th><th>分类</th><th>处理</th><th class="num">未读</th><th class="num">文章</th><th>上次更新</th><th>状态</th></tr>
-{% for f in feeds %}
-<tr>
-  <td class="ellipsis"><a href="/admin/feeds/{{ f.id }}">{{ f.title }}</a>{% if !f.enabled %} <span class="badge">已停用</span>{% endif %}<div class="small muted ellipsis">{{ f.url }}</div></td>
-  <td>{{ f.category }}</td>
-  <td>{% for b in f.badges %}<span class="badge on">{{ b }}</span>{% endfor %}</td>
-  <td class="num">{{ f.unread }}</td>
-  <td class="num">{{ f.items }}</td>
-  <td class="small">{{ f.last_fetch }}</td>
-  <td class="small">{% if f.error.is_empty() %}<span class="ok">正常</span>{% else %}<span class="err" title="{{ f.error }}">错误 ×{{ f.error_count }}</span>{% endif %}</td>
-</tr>
-{% endfor %}
-</table></div>
-{% if feeds.is_empty() %}<p class="muted">还没有订阅。添加一个，或导入 OPML。</p>{% endif %}
 {% endblock %}

@@ -1,45 +1,79 @@
 {% extends "base.html" %}
 {% block title %}概览{% endblock %}
 {% block content %}
-<h1>概览</h1>
-<div class="grid">
-  <div class="stat"><b>{{ s.feeds }}</b><span>订阅源（{{ s.feeds_error }} 个出错）</span></div>
-  <div class="stat"><b>{{ s.unread }}</b><span>未读文章 / 共 {{ s.items }}</span></div>
-  <div class="stat"><b>{{ s.starred }}</b><span>收藏</span></div>
-  <div class="stat"><b>{{ s.pending }}</b><span>处理中（失败 {{ s.failed }}）</span></div>
-  <div class="stat"><b>{{ s.updates }}</b><span>24 小时内发布的新版本</span></div>
-  <div class="stat"><b>{{ s.images }}</b><span>缓存图片（{{ s.images_size }}）</span></div>
-  <div class="stat"><b>{{ s.db_size }}</b><span>数据库大小</span></div>
-  <div class="stat"><b>{{ s.uptime }}</b><span>运行时间</span></div>
+<div class="page-head">
+  <div><h1>概览</h1><div class="sub">运行 {{ s.uptime }} · 数据库 {{ s.db_size }}</div></div>
+  <div class="actions">
+    <form method="post" action="/admin/feeds/refresh-all" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="btn"><svg class="icon sm"><use href="#i-refresh"/></svg>全部刷新</button></form>
+    <a class="btn primary" href="/admin/feeds"><svg class="icon sm"><use href="#i-plus"/></svg>添加订阅</a>
+  </div>
 </div>
 
-<div class="card">
-  <h3 style="margin-top:0">阅读器连接</h3>
-  <table>
-    <tr><th>Google Reader / FreshRSS API</th><td><code>{{ s.base }}/api/greader.php</code><div class="help">Reeder、NetNewsWire、FeedMe、FocusReader、Read You、Fluent Reader 等选择 FreshRSS / Google Reader 类型。也兼容 <code>/plugins.local/freshapi/api/greader.php</code> 与根路径 <code>{{ s.base }}</code>。</div></td></tr>
-    <tr><th>TT-RSS API</th><td><code>{{ s.base }}</code>（客户端会自动追加 <code>/api/</code>）<div class="help">TTRSS-Reader、News+、Fiery Feeds、tt-rss Android 等。也可使用 <code>{{ s.base }}/tt-rss</code>。</div></td></tr>
-    <tr><th>用户名 / 密码</th><td><code>{{ s.username }}</code> / {% if s.api_password %}API 专用密码{% else %}与管理密码相同{% endif %}（<a href="/admin/account">修改</a>）</td></tr>
-  </table>
+<div class="stats">
+  <a class="stat" href="/admin/feeds"><div class="label"><svg class="icon sm"><use href="#i-rss"/></svg>订阅</div><div class="value">{{ s.feeds }}</div><div class="foot">{% if s.feeds_error > 0 %}<span class="err">{{ s.feeds_error }} 个抓取出错</span>{% else %}全部正常{% endif %}</div></a>
+  <a class="stat" href="/admin/items?state=unread"><div class="label"><svg class="icon sm"><use href="#i-inbox"/></svg>未读</div><div class="value">{{ s.unread }}</div><div class="foot">共 {{ s.items }} 篇 · 收藏 {{ s.starred }}</div></a>
+  <a class="stat" href="/admin/tasks"><div class="label"><svg class="icon sm"><use href="#i-activity"/></svg>处理队列</div><div class="value">{{ s.pending }}</div><div class="foot">{% if s.failed > 0 %}<span class="err">失败 {{ s.failed }}</span>{% else %}无失败任务{% endif %}</div></a>
+  <a class="stat" href="/admin/items?state=updated"><div class="label"><svg class="icon sm"><use href="#i-layers"/></svg>24 小时新闻更新</div><div class="value">{{ s.updates }}</div><div class="foot">以新 ID 发布的修订版</div></a>
 </div>
 
-<div class="card">
-  <h3 style="margin-top:0">翻译服务</h3>
-  {% if s.tr_configured %}
-  <p>模型 <code>{{ s.tr_model }}</code> ·
-    {% if let Some(c) = s.tr_circuit %}<span class="err">已暂停（{{ c }} 后重试）</span>{% else %}<span class="ok">正常</span>{% endif %}
-    · 请求 {{ s.tr_requests }} 次，失败 {{ s.tr_failures }} 次，缓存命中 {{ s.tr_cache_hits }} 段，Token {{ s.tr_tokens }}，进行中 {{ s.tr_in_flight }}</p>
-  {% if let Some(e) = s.tr_last_error %}<p class="small err">最近错误：{{ e }}</p>{% endif %}
-  {% else %}
-  <p class="muted">未配置。请在 <a href="/admin/settings#translation">设置</a> 中填写 OpenAI 兼容接口。</p>
-  {% endif %}
+<div class="grid-2">
+  <div class="card">
+    <div class="card-head"><h3>阅读器连接</h3><a class="hint" href="/admin/account">账户与密码</a></div>
+    <div class="stack-sm">
+      <div class="field">
+        <div class="label">Google Reader / FreshRSS API</div>
+        <div class="copy"><code>{{ s.base }}/api/greader.php</code><button class="btn sm ghost" type="button" data-copy="{{ s.base }}/api/greader.php"><svg class="icon sm"><use href="#i-copy"/></svg>复制</button></div>
+        <div class="help">Reeder、NetNewsWire、Read You、FeedMe、FocusReader 等选择 FreshRSS 或 Google Reader 类型。</div>
+      </div>
+      <div class="field">
+        <div class="label">TT-RSS API</div>
+        <div class="copy"><code>{{ s.base }}</code><button class="btn sm ghost" type="button" data-copy="{{ s.base }}"><svg class="icon sm"><use href="#i-copy"/></svg>复制</button></div>
+        <div class="help">TTRSS-Reader、News+、Fiery Feeds 等；客户端会自动追加 /api/。</div>
+      </div>
+      <dl class="kv">
+        <dt>用户名</dt><dd><code>{{ s.username }}</code></dd>
+        <dt>密码</dt><dd class="text-2">{% if s.api_password %}API 专用密码{% else %}与管理密码相同{% endif %}</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>AI 翻译</h3>{% if s.tr_configured %}<span class="status {{ s.tr_state }}"><span class="dot {{ s.tr_state }}"></span>{{ s.tr_state_label }}</span>{% endif %}</div>
+    {% if s.tr_configured %}
+    <dl class="kv">
+      <dt>模型</dt><dd><code>{{ s.tr_model }}</code></dd>
+      <dt>请求</dt><dd class="num">{{ s.tr_requests }} 次{% if s.tr_failures > 0 %} · <span class="err">失败 {{ s.tr_failures }}</span>{% endif %} · 进行中 {{ s.tr_in_flight }}</dd>
+      <dt>缓存命中</dt><dd class="num">{{ s.tr_cache_hits }} 段</dd>
+      <dt>Token</dt><dd class="num">{{ s.tr_tokens }}</dd>
+    </dl>
+    {% if let Some(e) = s.tr_last_error %}<div class="callout err"><b>最近错误</b>{{ e }}{% if let Some(h) = s.tr_hint %}<div class="callout-hint">{{ h }}修改设置并保存后会立即恢复。</div>{% endif %}</div>{% endif %}
+    <div class="form-actions">
+      {% if s.tr_state == "err" %}<form method="post" action="/admin/tasks/retry" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="btn sm"><svg class="icon sm"><use href="#i-refresh"/></svg>立即重试</button></form>{% endif %}
+      <a class="btn sm ghost" href="/admin/settings#translation">翻译设置</a>
+    </div>
+    {% else %}
+    <div class="empty compact"><svg class="icon"><use href="#i-globe"/></svg><div>尚未配置翻译接口</div><a class="btn sm" href="/admin/settings#translation" style="margin-top:12px">去设置</a></div>
+    {% endif %}
+  </div>
 </div>
 
-<h2>处理队列</h2>
-<div class="table-wrap"><table>
-<tr><th>阶段</th><th class="num">待处理</th><th class="num">等待重试</th></tr>
-{% for r in stages %}<tr><td>{{ r.0 }}</td><td class="num">{{ r.1 }}</td><td class="num">{{ r.2 }}</td></tr>{% endfor %}
-</table></div>
-
-<h2>最近事件 <a class="small" href="/admin/events">全部</a></h2>
-{% include "events_table.html" %}
+<div class="grid-2">
+  <div class="card">
+    <div class="card-head"><h3>处理流水线</h3><span class="hint">{% if queue_total == 0 %}空闲{% else %}{{ queue_total }} 篇处理中{% endif %}</span></div>
+    <div class="bars">
+      {% for r in stages %}
+      <div class="bar-row"><span class="text-2">{{ r.name }}</span><div class="bar"><span style="width:{{ r.due_pct }}%"></span><span class="wait" style="width:{{ r.wait_pct }}%"></span></div><span class="num small muted" style="text-align:right">{{ r.due }}{% if r.waiting > 0 %} · <span class="warn">{{ r.waiting }} 等待</span>{% endif %}</span></div>
+      {% endfor %}
+    </div>
+    <hr>
+    <dl class="kv">
+      <dt>图片缓存</dt><dd>{{ s.images }} 张 · {{ s.images_size }}</dd>
+      <dt>数据库</dt><dd>{{ s.db_size }}</dd>
+    </dl>
+  </div>
+  <div class="card flush">
+    <div class="card-head"><h3>最近事件</h3><a class="hint" href="/admin/events">全部日志</a></div>
+    {% include "events_list.html" %}
+  </div>
+</div>
 {% endblock %}

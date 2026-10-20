@@ -4,20 +4,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
 <title>登录 · RillRSS</title>
-<link rel="stylesheet" href="/admin/static/admin.css">
+<script>try{var t=localStorage.getItem('rill-theme');if(t){document.documentElement.setAttribute('data-theme',t)}}catch(e){}</script>
+<style>{{ css|safe }}</style>
 </head>
 <body>
-<div class="login card">
-  <h1>RillRSS</h1>
-  {% if let Some(err) = error %}<div class="flash err">{{ err }}</div>{% endif %}
-  <form method="post" action="/admin/login">
-    <label for="u">用户名</label>
-    <input type="text" id="u" name="username" value="{{ username }}" autocomplete="username" required>
-    <label for="p">密码</label>
-    <input type="password" id="p" name="password" autocomplete="current-password" required autofocus>
-    <div class="actions"><button>登录</button></div>
-  </form>
+<div class="auth">
+  <div class="card">
+    <div class="brand"><span class="logo"><svg viewBox="0 0 24 24"><path d="M3.5 9c2.8-2.6 5.7 2.6 8.5 0s5.7 2.6 8.5 0"/><path d="M3.5 15c2.8-2.6 5.7 2.6 8.5 0s5.7 2.6 8.5 0"/></svg></span><span class="brand-name">RillRSS</span></div>
+    <h1 style="font-size:19px">登录管理后台</h1>
+    <p class="muted small" style="margin-top:4px">订阅管理、内容处理与运行状态</p>
+    {% if let Some(err) = error %}<div class="flash err" role="alert" style="margin:16px 0 0"><div>{{ err }}</div></div>{% endif %}
+    <form method="post" action="/admin/login" class="stack" style="margin-top:20px">
+      <div class="field"><label for="u">用户名</label><input type="text" id="u" name="username" value="{{ username }}" autocomplete="username" required></div>
+      <div class="field"><label for="p">密码</label><input type="password" id="p" name="password" autocomplete="current-password" required autofocus></div>
+      <button class="btn primary block" style="height:38px">登录</button>
+    </form>
+  </div>
 </div>
 </body>
 </html>
