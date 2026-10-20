@@ -4,7 +4,8 @@
 //! but the canonical link (`u:` key) belongs to an existing story whose guids are no
 //! longer present in the document, it is the same story with a churned guid (e.g. feeds
 //! whose guid is md5(title)). Links shared by several entries of one document are never
-//! used for matching.
+//! used for matching. Short numeric guid fragments (BBC section indexes) are ignored,
+//! unless entries of the same document that only differ by them are different articles.
 //!
 //! Change handling: a changed entry of an already published story creates a revision
 //! only when the change is substantive (or, with full text enabled, when the page must
@@ -16,6 +17,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::parse::ParsedEntry;
+use crate::content::{extract, sanitize};
 use crate::settings::{FeedOptions, FulltextMode, Settings, UpdateMode, UpdateSettings};
 use crate::util::text::{self, ChangeStats};
 use crate::util::{self, urlnorm};
@@ -48,17 +50,23 @@ pub struct ChangeAssessment {
 
 pub fn assess_change(old_title: &str, old_text: &str, new_title: &str, new_text: &str, us: &UpdateSettings) -> ChangeAssessment {
     let stats = text::change_stats(old_text, new_text);
-    let content_sub = stats.is_substantive(&us.thresholds());
+    // A large net removal is not news: when a substantial text (50+ tokens, i.e. more than
+    // a summary) comes back less than half as long, it is far more likely a paywall teaser,
+    // consent or error page, or a feed that switched to summaries than a rewrite. Such a
+    // version is never published as an update (missing a real shortening is the price).
+    let shrunk = stats.old_tokens >= 50 && stats.new_tokens * 2 < stats.old_tokens;
+    let content_sub = !shrunk && stats.is_substantive(&us.thresholds());
     let title_changed = text::title_key(old_title) != text::title_key(new_title);
     let title_sim = text::title_similarity(old_title, new_title);
-    let title_sub = title_changed && title_sim < 0.7 && (us.title_only_triggers || stats.added + stats.removed >= 10);
+    let title_sub = !shrunk && title_changed && title_sim < 0.7 && (us.title_only_triggers || stats.added + stats.removed >= 10);
     let substantive = content_sub || title_sub;
     let summary = format!(
-        "相似度 {:.2}，新增 {} / 删除 {}，标题{}",
+        "相似度 {:.2}，新增 {} / 删除 {}，标题{}{}",
         stats.similarity,
         stats.added,
         stats.removed,
-        if title_changed { format!("已变化（相似度 {title_sim:.2}）") } else { "未变".into() }
+        if title_changed { format!("已变化（相似度 {title_sim:.2}）") } else { "未变".into() },
+        if shrunk { format!("；正文缩短到 {} / {} 词，视为截断页面", stats.new_tokens, stats.old_tokens) } else { String::new() }
     );
     ChangeAssessment { substantive, title_changed, stats, summary }
 }
@@ -66,6 +74,12 @@ pub fn assess_change(old_title: &str, old_text: &str, new_title: &str, new_text:
 /// Normalized source text of an HTML fragment (used for change detection).
 pub fn source_text(html: &str) -> String {
     text::normalize_for_compare(&text::html_to_text(html))
+}
+
+/// Normalized text of feed-entry content as the pipeline renders it (remove_selector,
+/// sanitizing): comparable with the baseline a feed-content version stores at publish.
+pub fn feed_text(html: &str, opts: &FeedOptions) -> String {
+    source_text(&sanitize::sanitize(&extract::apply_remove(html, &opts.remove_selector), None))
 }
 
 pub fn initial_stage(opts: &FeedOptions) -> &'static str {
@@ -79,8 +93,15 @@ fn entry_hash(e: &ParsedEntry) -> String {
 struct Prepared<'a> {
     e: &'a ParsedEntry,
     gkey: String,
+    /// The full guid when `gkey` dropped its fragment (looked up first, and registered).
+    raw: Option<String>,
     ukey: String,
     published: i64,
+}
+
+/// Two entries are the same article listed twice (BBC: one story in several sections).
+fn same_article(a: &ParsedEntry, b: &ParsedEntry) -> bool {
+    text::title_key(&a.title) == text::title_key(&b.title) || source_text(&a.html) == source_text(&b.html)
 }
 
 #[derive(Debug)]
@@ -164,11 +185,13 @@ pub fn obsolete_pending(tx: &Transaction, story_id: i64, now: i64) -> Result<usi
     )?)
 }
 
-fn add_keys(tx: &Transaction, feed_id: i64, story_id: i64, gkey: &str, ukey: Option<&str>) -> Result<()> {
-    tx.execute(
-        "INSERT OR IGNORE INTO story_keys(feed_id, key, story_id) VALUES (?, ?, ?)",
-        params![feed_id, format!("g:{gkey}"), story_id],
-    )?;
+fn add_keys(tx: &Transaction, feed_id: i64, story_id: i64, gkeys: &[&str], ukey: Option<&str>) -> Result<()> {
+    for gkey in gkeys {
+        tx.execute(
+            "INSERT OR IGNORE INTO story_keys(feed_id, key, story_id) VALUES (?, ?, ?)",
+            params![feed_id, format!("g:{gkey}"), story_id],
+        )?;
+    }
     if let Some(u) = ukey.filter(|u| !u.is_empty()) {
         tx.execute(
             "INSERT OR IGNORE INTO story_keys(feed_id, key, story_id) VALUES (?, ?, ?)",
@@ -185,12 +208,30 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
     let fetch = &ctx.settings.fetch;
     let us = &ctx.settings.updates;
 
-    // 1. Prepare and de-duplicate entries within the document.
+    // 1. Prepare and de-duplicate entries within the document. Entries whose guids only
+    // differ by a short numeric fragment are one article listed twice, unless they are
+    // different articles: then each keeps its full guid.
+    let shortened: Vec<String> = entries.iter().map(|e| urlnorm::guid_key(&e.guid, e.link.as_deref())).collect();
+    let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, k) in shortened.iter().enumerate() {
+        by_key.entry(k.as_str()).or_default().push(i);
+    }
+    let distinct: HashSet<&str> = by_key
+        .iter()
+        .filter(|(k, idx)| {
+            idx.len() > 1
+                && idx.iter().any(|&i| entries[i].guid.trim() != **k)
+                && idx[1..].iter().any(|&i| !same_article(&entries[idx[0]], &entries[i]))
+        })
+        .map(|(k, _)| *k)
+        .collect();
     let mut seen_g: HashSet<String> = HashSet::new();
     let mut ukey_guids: HashMap<String, HashSet<String>> = HashMap::new();
     let mut prepared: Vec<Prepared> = Vec::new();
-    for e in entries {
-        let gkey = urlnorm::guid_key(&e.guid);
+    for (i, e) in entries.iter().enumerate() {
+        let full = e.guid.trim().to_string();
+        let gkey = if distinct.contains(shortened[i].as_str()) { full.clone() } else { shortened[i].clone() };
+        let raw = (full != gkey).then_some(full);
         let ukey = e.link.as_deref().map(urlnorm::url_key).unwrap_or_default();
         if !ukey.is_empty() {
             ukey_guids.entry(ukey.clone()).or_default().insert(gkey.clone());
@@ -202,11 +243,12 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
         if published > now + 86400 || published <= 0 {
             published = now;
         }
-        prepared.push(Prepared { e, gkey, ukey, published });
+        prepared.push(Prepared { e, gkey, raw, ukey, published });
     }
     let shared_ukeys: HashSet<String> =
         ukey_guids.iter().filter(|(_, g)| g.len() > 1).map(|(u, _)| u.clone()).collect();
-    let doc_gkeys: HashSet<String> = prepared.iter().map(|p| format!("g:{}", p.gkey)).collect();
+    let doc_gkeys: HashSet<String> =
+        prepared.iter().flat_map(|p| std::iter::once(&p.gkey).chain(p.raw.as_ref())).map(|k| format!("g:{k}")).collect();
 
     // 2. First fetch? Then only the newest `initial_items` entries are processed.
     let existing: i64 = tx.query_row("SELECT COUNT(*) FROM stories WHERE feed_id = ?", [ctx.feed_id], |r| r.get(0))?;
@@ -232,10 +274,20 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
         let gk = format!("g:{}", p.gkey);
         let uk = if p.ukey.is_empty() || shared_ukeys.contains(&p.ukey) { None } else { Some(p.ukey.clone()) };
 
-        // Match by guid, then by link (guid churn).
-        let mut story_id: Option<i64> = tx
-            .query_row("SELECT story_id FROM story_keys WHERE feed_id = ? AND key = ?", params![ctx.feed_id, gk], |r| r.get(0))
-            .optional()?;
+        // Match by guid (the full one first: it may have been registered when this entry
+        // had to be told apart from another), then by link (guid churn).
+        let lookup = |key: &str| -> Result<Option<i64>> {
+            Ok(tx
+                .query_row("SELECT story_id FROM story_keys WHERE feed_id = ? AND key = ?", params![ctx.feed_id, key], |r| r.get(0))
+                .optional()?)
+        };
+        let mut story_id = match &p.raw {
+            Some(raw) => lookup(&format!("g:{raw}"))?,
+            None => None,
+        };
+        if story_id.is_none() {
+            story_id = lookup(&gk)?;
+        }
         if story_id.is_none()
             && let Some(u) = &uk
         {
@@ -257,6 +309,7 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
         }
 
         let ehash = entry_hash(e);
+        let gkeys: Vec<&str> = std::iter::once(p.gkey.as_str()).chain(p.raw.as_deref()).collect();
         match story_id {
             None => {
                 // New story.
@@ -267,7 +320,7 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
                     params![ctx.feed_id, e.guid, e.link, e.title, p.published, now, now, ehash, if skip { "skipped" } else { "active" }],
                 )?;
                 let sid = tx.last_insert_rowid();
-                add_keys(tx, ctx.feed_id, sid, &p.gkey, uk.as_deref())?;
+                add_keys(tx, ctx.feed_id, sid, &gkeys, uk.as_deref())?;
                 if skip {
                     report.skipped += 1;
                 } else {
@@ -281,7 +334,7 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
                     "UPDATE stories SET last_seen_at = ?, guid = ?, link = COALESCE(?, link) WHERE id = ?",
                     params![now, e.guid, e.link, sid],
                 )?;
-                add_keys(tx, ctx.feed_id, sid, &p.gkey, uk.as_deref())?;
+                add_keys(tx, ctx.feed_id, sid, &gkeys, uk.as_deref())?;
                 if s.entry_hash.as_deref() == Some(ehash.as_str()) || s.state == "skipped" {
                     report.unchanged += 1;
                     continue;
@@ -316,8 +369,8 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
                 }
 
                 if !fulltext {
-                    // Confirm right away using the feed content.
-                    let new_text = source_text(&e.html);
+                    // Confirm right away using the feed content, rendered like the baseline.
+                    let new_text = feed_text(&e.html, ctx.opts);
                     let a = assess_change(
                         s.source_title.as_deref().unwrap_or(&s.title),
                         s.source_text.as_deref().unwrap_or(""),
@@ -431,6 +484,62 @@ mod tests {
         assert_eq!(r.new_stories, 0);
         assert_eq!(count(&db, "SELECT COUNT(*) FROM stories"), 1);
         assert_eq!(count(&db, "SELECT COUNT(*) FROM revisions"), 1);
+    }
+
+    #[test]
+    fn numeric_guid_fragments_never_merge_different_articles() {
+        let (_d, db, fid) = setup();
+        let opts = FeedOptions::default();
+        let settings = Settings::default();
+        let now = 1_800_000_000;
+        let live = "https://ex.example.com/live";
+        // A live page whose posts are told apart only by `#N` (links without fragment).
+        let post = |n: i64| entry(&format!("{live}#{n}"), &format!("Post {n}: what happened"), live, &format!("<p>Post number {n} with its own words.</p>"), now - 100 + n);
+        let r = run(&db, fid, &opts, &settings, now, &[post(3), post(2), post(1)]);
+        assert_eq!(r.new_stories, 3);
+        // The next document keeps two of them and adds one: matched by their full guids.
+        let r = run(&db, fid, &opts, &settings, now + 60, &[post(4), post(3)]);
+        assert_eq!((r.new_stories, r.unchanged), (1, 1));
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM stories"), 4);
+        // Releases whose links point at the numbered anchor keep their full guid.
+        let rel = |n: i64| entry(&format!("https://ex.example.com/changelog#{n}"), "Release notes", &format!("https://ex.example.com/changelog#{n}"), "<p>Notes.</p>", now - n);
+        let r = run(&db, fid, &opts, &settings, now + 120, &[rel(1), rel(2)]);
+        assert_eq!(r.new_stories, 2);
+    }
+
+    #[test]
+    fn bbc_section_index_duplicates_still_merge() {
+        let (_d, db, fid) = setup();
+        let opts = FeedOptions::default();
+        let settings = Settings::default();
+        let now = 1_800_000_000;
+        let g = |n: u32| format!("https://www.bbc.com/news/articles/c0k8xyz#{n}");
+        let link = "https://www.bbc.com/news/articles/c0k8xyz?at_medium=RSS&at_campaign=rss";
+        // Listed in two sections of the same document ('#0' and '#1').
+        let r = run(&db, fid, &opts, &settings, now, &[entry(&g(0), "Curfew in Paris", link, BODY, now - 50), entry(&g(1), "Curfew in Paris", link, BODY, now - 50)]);
+        assert_eq!(r.new_stories, 1);
+        publish_all(&db, now);
+        let r = run(&db, fid, &opts, &settings, now + 600, &[entry(&g(3), "Curfew in Paris", link, BODY, now - 50)]);
+        assert_eq!((r.new_stories, r.updates), (0, 0));
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM stories"), 1);
+    }
+
+    #[test]
+    fn a_page_shrunk_to_a_teaser_is_not_an_update() {
+        let us = UpdateSettings::default();
+        let full: String = (0..8)
+            .map(|i| format!("Paragraph {i}: the minister announced rule number {i} for car parks, and drivers in region {i} may challenge charge {i}. "))
+            .collect();
+        let teaser = format!("{} Subscribe to continue reading this article.", &full[..full.len() / 3]);
+        let a = assess_change("Parking rules", &source_text(&full), "Parking rules", &source_text(&teaser), &us);
+        assert!(!a.substantive, "{}", a.summary);
+        assert!(a.summary.contains("截断"), "{}", a.summary);
+        // Growth is still news.
+        let more = format!(
+            "{full} Officials said fines would also be capped at a new lower level from next spring, after a consultation with motoring groups, \
+             consumer organisations and operators. The opposition welcomed the plan but warned that enforcement had failed before and asked for an independent regulator."
+        );
+        assert!(assess_change("Parking rules", &source_text(&full), "Parking rules", &source_text(&more), &us).substantive);
     }
 
     #[test]

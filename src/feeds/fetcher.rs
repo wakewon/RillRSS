@@ -217,6 +217,20 @@ async fn download(app: &AppRef, settings: &Settings, feed: &FeedRow) -> Result<F
 async fn fetch_and_ingest(app: &AppRef, settings: &Arc<Settings>, feed: &FeedRow) -> Result<(FetchOutcome, CacheMeta)> {
     let f = download(app, settings, feed).await?;
     if f.status == 304 {
+        // The document is unchanged, so the stories it listed are still in the feed: keep
+        // them "seen" (cleanup deletes stories not seen for weeks, and a quiet feed would
+        // otherwise bring its old entries back as new ones).
+        let (feed_id, now) = (feed.id, util::now());
+        app.db
+            .call(move |c| {
+                c.execute(
+                    "UPDATE stories SET last_seen_at = ?1
+                     WHERE feed_id = ?2 AND last_seen_at = (SELECT MAX(last_seen_at) FROM stories WHERE feed_id = ?2)",
+                    params![now, feed_id],
+                )?;
+                Ok(())
+            })
+            .await?;
         spawn_icon_refresh(app, feed.clone(), None);
         return Ok((FetchOutcome { status: 304, not_modified: true, ..Default::default() }, CacheMeta::default()));
     }

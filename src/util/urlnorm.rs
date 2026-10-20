@@ -94,11 +94,17 @@ static SHORT_NUMERIC_FRAGMENT: LazyLock<Regex> =
 
 /// Normalized guid used for identity. URL-like guids carrying a short numeric fragment
 /// (e.g. BBC's `https://www.bbc.co.uk/news/articles/xyz#2`, where the number is a
-/// front-page section index that changes over time) are reduced to the bare URL.
-pub fn guid_key(raw: &str) -> String {
+/// front-page section index that changes over time) are reduced to the bare URL — unless
+/// the entry's link points at the same fragment (`…/changelog#12`): then the number
+/// identifies the entry.
+pub fn guid_key(raw: &str, link: Option<&str>) -> String {
     let g = raw.trim();
     if let Some(c) = SHORT_NUMERIC_FRAGMENT.captures(g) {
-        return c[1].to_string();
+        let fragment = &g[c[1].len() + 1..];
+        let link_has_it = link.and_then(|l| l.trim().rsplit_once('#')).is_some_and(|(_, f)| f == fragment);
+        if !link_has_it {
+            return c[1].to_string();
+        }
     }
     g.to_string()
 }
@@ -156,17 +162,24 @@ mod tests {
     #[test]
     fn guid_fragment_handling() {
         assert_eq!(
-            guid_key("https://www.bbc.co.uk/news/articles/cj62y9dnd6pwo#2"),
+            guid_key("https://www.bbc.co.uk/news/articles/cj62y9dnd6pwo#2", None),
             "https://www.bbc.co.uk/news/articles/cj62y9dnd6pwo"
+        );
+        assert_eq!(
+            guid_key("https://www.bbc.com/news/articles/c0k8#0", Some("https://www.bbc.com/news/articles/c0k8?at_medium=RSS&at_campaign=rss")),
+            "https://www.bbc.com/news/articles/c0k8"
         );
         // Long / non-numeric fragments are meaningful (e.g. live-blog posts).
         assert_eq!(
-            guid_key("https://example.com/live#post-12"),
+            guid_key("https://example.com/live#post-12", None),
             "https://example.com/live#post-12"
         );
-        assert_eq!(guid_key("https://example.com/live#123456"), "https://example.com/live#123456");
-        assert_eq!(guid_key("383e2acf01ad8ffb1c19cb201311ed07"), "383e2acf01ad8ffb1c19cb201311ed07");
-        assert_eq!(guid_key("tag:example.com,2024:1#2"), "tag:example.com,2024:1#2");
+        assert_eq!(guid_key("https://example.com/live#123456", None), "https://example.com/live#123456");
+        assert_eq!(guid_key("383e2acf01ad8ffb1c19cb201311ed07", None), "383e2acf01ad8ffb1c19cb201311ed07");
+        assert_eq!(guid_key("tag:example.com,2024:1#2", None), "tag:example.com,2024:1#2");
+        // The link points at the same numbered anchor: the number identifies the entry.
+        assert_eq!(guid_key("https://example.com/changelog#12", Some("https://example.com/changelog#12")), "https://example.com/changelog#12");
+        assert_eq!(guid_key("https://example.com/a#1", Some("https://example.com/a#comments")), "https://example.com/a");
     }
 
     #[test]

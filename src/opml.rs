@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use quick_xml::events::Event;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
+use url::Url;
 
 use crate::app::{AppRef, EventRef, Level};
 use crate::feeds::fetcher::ensure_category;
@@ -18,6 +19,10 @@ pub struct OpmlFeed {
     pub site_url: Option<String>,
     pub category: Option<String>,
     pub options: Option<String>,
+    /// `rill:titleLocked` of a RillRSS export (None in other readers' OPML).
+    pub title_locked: Option<bool>,
+    /// The outline names the feed (title/text) instead of falling back to its URL.
+    pub has_title: bool,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -62,11 +67,14 @@ pub fn parse(body: &[u8]) -> Result<Vec<OpmlFeed>> {
                 let is_empty = matches!(ev, Event::Empty(_));
                 if let Some(url) = get("xmlUrl") {
                     let category = stack.iter().rev().find_map(|c| c.clone());
+                    let name = get("title").or_else(|| get("text"));
                     out.push(OpmlFeed {
-                        title: get("title").or_else(|| get("text")).unwrap_or_else(|| url.clone()),
+                        has_title: name.is_some(),
+                        title: name.unwrap_or_else(|| url.clone()),
                         site_url: get("htmlUrl"),
                         category,
                         options: get("rill:options"),
+                        title_locked: get("rill:titleLocked").map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
                         url,
                     });
                     if !is_empty {
@@ -91,19 +99,26 @@ pub fn parse(body: &[u8]) -> Result<Vec<OpmlFeed>> {
     Ok(out)
 }
 
+fn is_http_url(u: &str) -> bool {
+    Url::parse(u).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
 /// Import an OPML document: create categories and feeds (existing URLs are skipped).
 pub async fn import(app: &AppRef, body: &[u8]) -> Result<ImportReport> {
     let feeds = parse(body)?;
     let now = util::now();
+    let converter = app.converter.clone();
     let report = app
         .db
         .write(move |tx| {
             let mut r = ImportReport { found: feeds.len(), ..Default::default() };
             let cats_before: i64 = tx.query_row("SELECT COUNT(*) FROM categories", [], |x| x.get(0))?;
             for f in feeds {
-                if !(f.url.starts_with("http://") || f.url.starts_with("https://")) {
+                // Only http(s) addresses are fetched or linked to.
+                if !is_http_url(&f.url) {
                     continue;
                 }
+                let site_url = f.site_url.filter(|u| is_http_url(u));
                 if tx.query_row("SELECT id FROM feeds WHERE url = ?", [&f.url], |x| x.get::<_, i64>(0)).optional()?.is_some() {
                     r.existing += 1;
                     continue;
@@ -112,10 +127,18 @@ pub async fn import(app: &AppRef, body: &[u8]) -> Result<ImportReport> {
                     Some(c) => ensure_category(tx, c)?,
                     None => None,
                 };
-                let opts = f.options.as_deref().map(FeedOptions::from_json).unwrap_or_default();
+                let mut opts = f.options.as_deref().map(FeedOptions::from_json).unwrap_or_default();
+                // Same check as the feed form: an unknown mode would fail every article.
+                if opts.opencc_enabled() && converter.get(&opts.opencc).is_err() {
+                    tracing::warn!(url = %f.url, mode = %opts.opencc, "OPML import: unknown OpenCC mode ignored");
+                    opts.opencc = String::new();
+                }
+                // Keep the names the subscriptions had: a RillRSS export says whether the
+                // title was set by hand; the names in other readers' exports are the user's.
+                let title_locked = f.title_locked.unwrap_or(f.has_title);
                 tx.execute(
-                    "INSERT INTO feeds (url, title, site_url, category_id, options, next_fetch_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![f.url, f.title, f.site_url, cid, opts.to_json(), now + (r.added as i64 % 60), now, now],
+                    "INSERT INTO feeds (url, title, title_locked, site_url, category_id, options, next_fetch_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![f.url, f.title, title_locked as i64, site_url, cid, opts.to_json(), now + (r.added as i64 % 60), now, now],
                 )?;
                 r.added += 1;
             }
@@ -138,14 +161,16 @@ pub async fn import(app: &AppRef, body: &[u8]) -> Result<ImportReport> {
 /// Export all subscriptions as OPML 2.0.
 pub async fn export(app: &AppRef) -> Result<String> {
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, String, Option<String>, Option<String>, String)> = app
+    let rows: Vec<(String, String, Option<String>, Option<String>, String, bool)> = app
         .db
         .call(|c| {
             let mut st = c.prepare(
-                "SELECT f.title, f.url, f.site_url, c.name, f.options FROM feeds f LEFT JOIN categories c ON c.id = f.category_id
+                "SELECT f.title, f.url, f.site_url, c.name, f.options, f.title_locked FROM feeds f LEFT JOIN categories c ON c.id = f.category_id
                  ORDER BY c.name COLLATE NOCASE, f.title COLLATE NOCASE",
             )?;
-            let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
+            let v = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0)))?
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(v)
         })
         .await?;
@@ -156,18 +181,19 @@ pub async fn export(app: &AppRef) -> Result<String> {
         "  <head>\n    <title>RillRSS subscriptions</title>\n    <dateCreated>{}</dateCreated>\n  </head>\n  <body>\n",
         chrono::Utc::now().to_rfc2822()
     ));
-    let outline = |title: &str, url: &str, site: &Option<String>, opts: &str, indent: &str| -> String {
+    let outline = |title: &str, url: &str, site: &Option<String>, opts: &str, locked: bool, indent: &str| -> String {
         let default_opts = FeedOptions::default().to_json();
         let opts_attr = if opts == default_opts || opts == "{}" { String::new() } else { format!(" rill:options=\"{}\"", escape(opts)) };
         format!(
-            "{indent}<outline type=\"rss\" text=\"{t}\" title=\"{t}\" xmlUrl=\"{u}\"{h}{opts_attr}/>\n",
+            "{indent}<outline type=\"rss\" text=\"{t}\" title=\"{t}\" xmlUrl=\"{u}\"{h}{opts_attr} rill:titleLocked=\"{l}\"/>\n",
+            l = locked as u8,
             t = escape(title),
             u = escape(url),
             h = site.as_ref().map(|s| format!(" htmlUrl=\"{}\"", escape(s))).unwrap_or_default()
         )
     };
     let mut current: Option<String> = None;
-    for (title, url, site, cat, opts) in &rows {
+    for (title, url, site, cat, opts, locked) in &rows {
         if cat != &current {
             if current.is_some() {
                 xml.push_str("    </outline>\n");
@@ -178,7 +204,7 @@ pub async fn export(app: &AppRef) -> Result<String> {
             current = cat.clone();
         }
         let indent = if current.is_some() { "      " } else { "    " };
-        xml.push_str(&outline(title, url, site, opts, indent));
+        xml.push_str(&outline(title, url, site, opts, *locked, indent));
     }
     if current.is_some() {
         xml.push_str("    </outline>\n");
@@ -210,6 +236,7 @@ mod tests {
         assert_eq!(f[2].title, "Top & Level");
         assert_eq!(f[2].url, "https://top.example.com/feed?a=1&b=2");
         assert_eq!(f[2].options.as_deref(), Some("{\"translate\":true}"));
+        assert_eq!((f[0].has_title, f[0].title_locked), (true, None));
         assert!(parse(b"<html></html>").is_err());
     }
 }
