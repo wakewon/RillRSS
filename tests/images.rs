@@ -68,3 +68,64 @@ async fn caches_dedupes_and_filters_images() {
     let dir = t.app.images.dir.clone();
     assert_eq!(rillrss::content::images::ImageStore::disk_usage(&dir), 0);
 }
+
+#[tokio::test]
+async fn gc_spares_images_of_articles_about_to_be_published() {
+    let mock = start_mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    mock.set("/a.png", "image/png", png(64, 48));
+    let html = |w: &str| format!("<p>{w} article with a picture and enough words to be an article.</p><img src=\"{}\">", mock.url("/a.png"));
+    mock.set("/f.xml", "application/rss+xml", rss("P", &[entry("1", "One", "https://n.example.com/1", &html("First"))]));
+    let fid;
+    let content1: String;
+    {
+        let t = start_app_in(dir.path().to_path_buf(), true, |_| {}).await;
+        fid = t.add_feed(&mock.url("/f.xml"), json!({"cache_images": true})).await;
+        t.fetch(fid).await;
+        t.wait_idle().await;
+        content1 = t.query("SELECT content FROM items", |r| r.get(0)).await;
+        assert!(content1.contains("rill-base://local/img/"));
+        t.app.shutdown.cancel();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let t = start_app_in(dir.path().to_path_buf(), false, |_| {}).await;
+    // Article 1 is gone (retention); its image row is days old.
+    let old = rillrss::util::now() - 3 * 86400;
+    t.app.db.call(move |c| Ok(c.execute_batch(&format!("DELETE FROM items; UPDATE images SET created_at = {old}"))?)).await.unwrap();
+    // Article 2 reused the cached image and waits for its publish stage.
+    mock.set("/f.xml", "application/rss+xml", rss("P", &[entry("2", "Two", "https://n.example.com/2", &html("Second"))]));
+    rillrss::feeds::fetcher::fetch_feed(&t.app, fid).await.unwrap();
+    let c2 = content1.replace("First", "Second");
+    t.app
+        .db
+        .call(move |c| Ok(c.execute("UPDATE revisions SET stage = 'publish', content_html = ? WHERE state = 'pending'", [c2])?))
+        .await
+        .unwrap();
+    let (n, _) = t.app.images.gc(86400).await.unwrap();
+    assert_eq!(n, 0, "referenced by a revision about to be published");
+    tokio::spawn(rillrss::pipeline::run_dispatcher(t.app.clone()));
+    t.wait_idle().await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM item_images").await, 1);
+    assert_eq!(t.count("SELECT COUNT(*) FROM images").await, 1);
+    assert!(rillrss::content::images::ImageStore::disk_usage(&t.app.images.dir) > 0, "file still there");
+    t.app.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn reusing_a_cached_image_renews_its_grace_period() {
+    let mock = start_mock().await;
+    let t = start_app(|_| {}).await;
+    mock.set("/a.png", "image/png", png(64, 48));
+    let html = |w: &str| format!("<p>{w} article with a picture and enough words to be an article.</p><img src=\"{}\">", mock.url("/a.png"));
+    mock.set("/f.xml", "application/rss+xml", rss("P", &[entry("1", "One", "https://n.example.com/1", &html("First"))]));
+    let fid = t.add_feed(&mock.url("/f.xml"), json!({"cache_images": true})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    let old = rillrss::util::now() - 3 * 86400;
+    t.app.db.call(move |c| Ok(c.execute_batch(&format!("DELETE FROM items; UPDATE images SET created_at = {old}"))?)).await.unwrap();
+    mock.set("/f.xml", "application/rss+xml", rss("P", &[entry("2", "Two", "https://n.example.com/2", &html("Second"))]));
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    assert!(t.count("SELECT created_at FROM images").await > old, "reuse renewed it");
+    assert_eq!(mock.hits("/a.png"), 1, "not downloaded again");
+}

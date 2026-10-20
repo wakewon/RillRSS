@@ -30,6 +30,9 @@ pub struct ImageStore {
     total_bytes: Arc<AtomicI64>,
     /// An eviction (see `evict`) is running in the background.
     evicting: Arc<AtomicBool>,
+    /// Serializes GC deletions (write) against adding / reusing cache entries (read), so
+    /// a file is never unlinked between "row exists" and "file written / reused".
+    gc_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -92,7 +95,13 @@ impl ImageStore {
     pub fn new(dir: PathBuf, db: Db) -> Result<ImageStore> {
         std::fs::create_dir_all(&dir)?;
         let total: i64 = db.conn()?.query_row("SELECT COALESCE(SUM(size), 0) FROM images", [], |r| r.get(0))?;
-        Ok(ImageStore { dir, db, total_bytes: Arc::new(AtomicI64::new(total)), evicting: Arc::new(AtomicBool::new(false)) })
+        Ok(ImageStore {
+            dir,
+            db,
+            total_bytes: Arc::new(AtomicI64::new(total)),
+            evicting: Arc::new(AtomicBool::new(false)),
+            gc_lock: Arc::new(tokio::sync::RwLock::new(())),
+        })
     }
 
     pub fn file_path(&self, hash: &str, ext: &str) -> PathBuf {
@@ -158,10 +167,15 @@ impl ImageStore {
             if status == "ok"
                 && let Some(h) = hash
             {
+                let _gc = self.gc_lock.read().await;
                 let h2 = h.clone();
+                let now = util::now();
                 let meta: Option<(String, Option<u32>, Option<u32>)> = self
                     .db
                     .call(move |c| {
+                        // Reuse renews the GC grace period: the article being processed only
+                        // references the image once it is published.
+                        c.execute("UPDATE images SET created_at = ? WHERE hash = ?", params![now, h2])?;
                         Ok(c.query_row("SELECT ext, width, height FROM images WHERE hash = ?", [h2], |r| {
                             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                         })
@@ -185,6 +199,7 @@ impl ImageStore {
                 let dims = imagesize::blob_size(&bytes).ok();
                 let (w, h) = dims.map(|d| (Some(d.width as u32), Some(d.height as u32))).unwrap_or((None, None));
                 let hash = blake3::hash(&bytes).to_hex().to_string();
+                let _gc = self.gc_lock.read().await;
                 self.write_file(&hash, ext, &bytes).await?;
                 let size = bytes.len() as i64;
                 let (h2, u2, mime2, ext2) = (hash.clone(), url.to_string(), mime.to_string(), ext.to_string());
@@ -195,6 +210,10 @@ impl ImageStore {
                             "INSERT OR IGNORE INTO images (hash, mime, ext, size, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             params![h2, mime2, ext2, size, w, h, now],
                         )?;
+                        if n == 0 {
+                            // Same bytes already cached (other URL): renew its grace period.
+                            c.execute("UPDATE images SET created_at = ? WHERE hash = ?", params![now, h2])?;
+                        }
                         c.execute(
                             "INSERT INTO image_sources (url, hash, status, error, attempts, fetched_at) VALUES (?, ?, 'ok', NULL, 1, ?)
                              ON CONFLICT(url) DO UPDATE SET hash = excluded.hash, status = 'ok', error = NULL, attempts = attempts + 1, fetched_at = excluded.fetched_at",
@@ -407,9 +426,20 @@ impl ImageStore {
     async fn drop_image(&self, hash: &str, ext: &str, size: i64) -> Result<bool> {
         let cached = format!("{BASE_MARKER}{}", public_path(hash, ext));
         let (h, now) = (hash.to_string(), util::now());
+        let _gc = self.gc_lock.write().await;
         let dropped = self
             .db
             .write(move |tx| {
+                // An article on its way to publish references the image only in its
+                // revision: leave the image to it.
+                let in_flight: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM revisions WHERE state = 'pending' AND stage = 'publish' AND instr(content_html, ?) > 0)",
+                    [&h],
+                    |r| r.get(0),
+                )?;
+                if in_flight {
+                    return Ok(false);
+                }
                 let original: Option<String> = tx
                     .query_row("SELECT url FROM image_sources WHERE hash = ? AND status = 'ok' ORDER BY fetched_at DESC LIMIT 1", [&h], |r| r.get(0))
                     .optional()?;
@@ -450,8 +480,8 @@ impl ImageStore {
             .await
     }
 
-    /// Delete images no longer referenced by any item (older than `grace_secs`).
-    /// Returns (files deleted, bytes freed).
+    /// Delete images no longer referenced by any item nor by a revision waiting to be
+    /// published (older than `grace_secs`). Returns (files deleted, bytes freed).
     pub async fn gc(&self, grace_secs: i64) -> Result<(usize, i64)> {
         let cutoff = util::now() - grace_secs;
         let orphans: Vec<(String, String, i64)> = self
@@ -469,16 +499,29 @@ impl ImageStore {
         let mut freed = 0i64;
         let mut deleted = 0usize;
         for (hash, ext, size) in orphans {
-            let p = self.file_path(&hash, &ext);
-            let _ = tokio::fs::remove_file(&p).await;
+            let _gc = self.gc_lock.write().await;
+            // The row goes first, re-checked under the same conditions; the file is only
+            // removed when the row really was deleted.
             let h2 = hash.clone();
-            self.db
-                .call(move |c| {
-                    c.execute("DELETE FROM images WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM item_images WHERE hash = ?)", params![h2, h2])?;
-                    c.execute("DELETE FROM image_sources WHERE hash = ?", [h2])?;
-                    Ok(())
+            let removed = self
+                .db
+                .write(move |tx| {
+                    let n = tx.execute(
+                        "DELETE FROM images WHERE hash = ?1 AND created_at < ?2
+                           AND NOT EXISTS (SELECT 1 FROM item_images WHERE hash = ?1)
+                           AND NOT EXISTS (SELECT 1 FROM revisions WHERE state = 'pending' AND stage = 'publish' AND instr(content_html, ?1) > 0)",
+                        params![h2, cutoff],
+                    )?;
+                    if n > 0 {
+                        tx.execute("DELETE FROM image_sources WHERE hash = ?", [&h2])?;
+                    }
+                    Ok(n > 0)
                 })
                 .await?;
+            if !removed {
+                continue;
+            }
+            let _ = tokio::fs::remove_file(self.file_path(&hash, &ext)).await;
             freed += size;
             deleted += 1;
         }
