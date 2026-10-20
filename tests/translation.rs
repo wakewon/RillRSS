@@ -87,7 +87,7 @@ async fn persistent_failure_publishes_original_with_note() {
     let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
     assert!(content.contains("prime minister"), "original text kept");
     let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
-    assert!(notes.contains("translation failed"), "{notes}");
+    assert!(notes.contains("翻译失败"), "{notes}");
 }
 
 #[tokio::test]
@@ -176,7 +176,7 @@ async fn articles_already_in_target_language_are_skipped() {
     t.wait_idle().await;
     assert_eq!(mock.llm_calls(), 0);
     let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
-    assert!(notes.contains("already in target language"));
+    assert!(notes.contains("已是目标语言"));
 }
 
 #[tokio::test]

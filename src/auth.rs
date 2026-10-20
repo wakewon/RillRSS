@@ -276,7 +276,7 @@ pub async fn api_login(app: &App, user: &str, password: &str, ip: Option<IpAddr>
     let ok = username_matches(app, user) && verify_api_password(app, password).await?;
     record_login(app, ip, ok);
     if !ok {
-        app.event(crate::app::Level::Warn, "api", Default::default(), format!("failed API login for '{}' from {:?}", util::truncate_chars(user, 64), ip))
+        app.event(crate::app::Level::Warn, "api", Default::default(), format!("API 登录失败：用户 '{}'，来自 {:?}", util::truncate_chars(user, 64), ip))
             .await;
     }
     Ok(ok)

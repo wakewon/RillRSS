@@ -54,11 +54,11 @@ pub fn assess_change(old_title: &str, old_text: &str, new_title: &str, new_text:
     let title_sub = title_changed && title_sim < 0.7 && (us.title_only_triggers || stats.added + stats.removed >= 10);
     let substantive = content_sub || title_sub;
     let summary = format!(
-        "similarity {:.2}, +{} / -{} shingles, title {}",
+        "相似度 {:.2}，新增 {} / 删除 {}，标题{}",
         stats.similarity,
         stats.added,
         stats.removed,
-        if title_changed { format!("changed ({title_sim:.2})") } else { "same".into() }
+        if title_changed { format!("已变化（相似度 {title_sim:.2}）") } else { "未变".into() }
     );
     ChangeAssessment { substantive, title_changed, stats, summary }
 }

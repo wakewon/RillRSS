@@ -35,11 +35,11 @@ pub const PROMPT_VERSION: &str = "p2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TranslateError {
-    #[error("translation service is not configured")]
+    #[error("未配置翻译服务")]
     NotConfigured,
-    #[error("translation service temporarily disabled after repeated failures (retry in {0:?})")]
+    #[error("翻译服务连续失败，已暂停（{0:?} 后重试）")]
     CircuitOpen(Duration),
-    #[error("translation API error: {0}")]
+    #[error("翻译接口错误：{0}")]
     Api(#[from] ApiError),
     #[error("{0}")]
     Other(String),
@@ -257,7 +257,7 @@ impl Translator {
         } else {
             Some(
                 serde_json::from_str::<serde_json::Value>(&s.extra_body)
-                    .map_err(|e| TranslateError::Other(format!("invalid extra request JSON: {e}")))?,
+                    .map_err(|e| TranslateError::Other(format!("附加请求参数不是有效的 JSON：{e}")))?,
             )
         };
         Ok(Arc::new(OpenAiCompat {
@@ -490,7 +490,7 @@ impl Translator {
         {
             let mut n = ctx.requests.lock().unwrap();
             if *n >= ctx.max_requests {
-                return Err(TranslateError::Other("too many requests for one article".into()));
+                return Err(TranslateError::Other("单篇文章请求次数过多".into()));
             }
             *n += 1;
         }

@@ -128,7 +128,7 @@ pub async fn import(app: &AppRef, body: &[u8]) -> Result<ImportReport> {
         Level::Info,
         "system",
         EventRef::default(),
-        format!("OPML import: {} feeds found, {} added, {} already subscribed, {} new categories", report.found, report.added, report.existing, report.categories),
+        format!("OPML 导入：发现 {} 个订阅，新增 {}，已存在 {}，新建分类 {}", report.found, report.added, report.existing, report.categories),
     )
     .await;
     app.wake_fetcher.notify_one();

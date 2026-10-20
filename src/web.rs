@@ -249,7 +249,7 @@ async fn login_post(State(app): State<AppRef>, headers: HeaderMap, ConnectInfo(p
     let ok = auth::username_matches(&app, &user) && auth::verify_password(&app, pass).await.unwrap_or(false);
     auth::record_login(&app, ip, ok);
     if !ok {
-        app.event(Level::Warn, "system", EventRef::default(), format!("failed admin login from {ip:?}")).await;
+        app.event(Level::Warn, "system", EventRef::default(), format!("后台登录失败，来自 {ip:?}")).await;
         return fail("用户名或密码错误。");
     }
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
@@ -1355,7 +1355,7 @@ async fn run_cleanup(State(app): State<AppRef>, headers: HeaderMap, body: Bytes)
     let _s = guard_post!(app, headers, form);
     match crate::maintenance::cleanup(&app).await {
         Ok(r) => {
-            app.event(Level::Info, "cleanup", EventRef::default(), format!("manual cleanup: {}", r.summary())).await;
+            app.event(Level::Info, "cleanup", EventRef::default(), format!("手动清理：{}", r.summary())).await;
             redirect_msg("/admin/tasks", &format!("清理完成：{}", r.summary()))
         }
         Err(e) => server_error(e),
@@ -1805,7 +1805,7 @@ async fn account_password(State(app): State<AppRef>, headers: HeaderMap, body: B
     }
     match auth::set_password(&app, new).await {
         Ok(_) => {
-            app.event(Level::Info, "system", EventRef::default(), "admin password changed").await;
+            app.event(Level::Info, "system", EventRef::default(), "管理密码已修改").await;
             Redirect::to("/admin/login").into_response()
         }
         Err(e) => server_error(e),

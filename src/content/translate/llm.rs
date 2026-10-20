@@ -26,11 +26,11 @@ pub struct ChatResponse {
 pub enum ApiError {
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String, retry_after: Option<Duration> },
-    #[error("network error: {0}")]
+    #[error("网络错误：{0}")]
     Network(String),
-    #[error("request timed out")]
+    #[error("请求超时")]
     Timeout,
-    #[error("invalid API response: {0}")]
+    #[error("接口返回无效：{0}")]
     BadResponse(String),
 }
 

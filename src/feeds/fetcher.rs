@@ -122,7 +122,7 @@ pub async fn fetch_feed(app: &AppRef, feed_id: i64) -> Result<FetchOutcome> {
                     "fetch",
                     EventRef::feed(feed_id),
                     format!(
-                        "fetched {} entries: {} new, {} updated, {} skipped, {} ignored changes ({} ms)",
+                        "抓取 {} 条：新增 {}，更新 {}，跳过 {}，忽略的变化 {}（{} ms）",
                         r.entries, r.new_stories, r.updates, r.skipped, r.ignored_changes, elapsed_ms
                     ),
                 )
@@ -156,7 +156,7 @@ pub async fn fetch_feed(app: &AppRef, feed_id: i64) -> Result<FetchOutcome> {
                 if errors >= 3 { Level::Error } else { Level::Warn },
                 "fetch",
                 EventRef::feed(feed_id),
-                format!("fetch failed ({errors} in a row, next try in {} min): {msg}", delay / 60),
+                format!("抓取失败（连续 {errors} 次，{} 分钟后重试）：{msg}", delay / 60),
             )
             .await;
             Err(err)
@@ -433,7 +433,7 @@ pub async fn add_feed(
         .await?;
     if created {
         app.wake_fetcher.notify_one();
-        app.event(Level::Info, "system", EventRef::feed(id), "subscribed").await;
+        app.event(Level::Info, "system", EventRef::feed(id), "已添加订阅").await;
     }
     Ok((id, created))
 }
@@ -447,7 +447,7 @@ pub async fn delete_feed(app: &AppRef, feed_id: i64) -> Result<()> {
             Ok(())
         })
         .await?;
-    app.event(Level::Info, "system", EventRef::default(), format!("feed {feed_id} deleted")).await;
+    app.event(Level::Info, "system", EventRef::default(), format!("已删除订阅 #{feed_id}")).await;
     Ok(())
 }
 

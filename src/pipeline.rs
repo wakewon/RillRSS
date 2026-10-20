@@ -272,7 +272,7 @@ async fn process_stage(app: &AppRef, id: i64, stage: &'static str) -> Result<Out
     }
     let feed_id = rev.feed_id;
     let Some(feed) = app.db.call(move |c| load_feed(c, feed_id)).await? else {
-        return Ok(Outcome::Failed("feed deleted".into()));
+        return Ok(Outcome::Failed("订阅已删除".into()));
     };
     let settings = app.settings.get().await;
     match stage {
@@ -281,7 +281,7 @@ async fn process_stage(app: &AppRef, id: i64, stage: &'static str) -> Result<Out
         "translate" => stage_translate(app, &settings, &feed, &rev).await,
         "images" => stage_images(app, &settings, &feed, &rev).await,
         "publish" => stage_publish(app, &settings, &feed, &rev).await,
-        _ => Ok(Outcome::Failed(format!("unknown stage {stage}"))),
+        _ => Ok(Outcome::Failed(format!("未知阶段 {stage}"))),
     }
 }
 
@@ -362,7 +362,7 @@ async fn apply_outcome(app: &AppRef, id: i64, stage: &'static str, outcome: Outc
                 })
                 .await?;
             if let Some((f, s)) = story {
-                app.event(Level::Error, stage, EventRef::story(f, s), format!("processing failed: {why}")).await;
+                app.event(Level::Error, stage, EventRef::story(f, s), format!("处理失败：{why}")).await;
             }
         }
     }
@@ -444,7 +444,7 @@ fn text_len(html: &str) -> usize {
 
 async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &Rev) -> Result<Outcome> {
     let Some(link) = rev.link.clone() else {
-        return Ok(Outcome::Advance(Advance { next: "transform", notes: vec!["full text: no article link".into()], ..Default::default() }));
+        return Ok(Outcome::Advance(Advance { next: "transform", notes: vec!["全文提取：没有原文链接".into()], ..Default::default() }));
     };
     let entry_html = rev.entry_html.clone().unwrap_or_default();
     let fallback = |note: String| {
@@ -453,16 +453,16 @@ async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
     let extracted = match extract_page(app, settings, feed, &link).await {
         Ok(p) => p,
         Err(PageError::Transient(e)) if rev.attempts < 3 => {
-            return Ok(Outcome::Retry { delay: retry_backoff(rev.attempts), error: format!("full text: {e}"), count_attempt: true });
+            return Ok(Outcome::Retry { delay: retry_backoff(rev.attempts), error: format!("全文提取：{e}"), count_attempt: true });
         }
         Err(PageError::Transient(e)) | Err(PageError::Permanent(e)) => {
-            app.event(Level::Warn, "extract", EventRef::story(rev.feed_id, rev.story_id), format!("full text failed, using feed content: {e}"))
+            app.event(Level::Warn, "extract", EventRef::story(rev.feed_id, rev.story_id), format!("全文提取失败，改用订阅内容：{e}"))
                 .await;
             if rev.reason == "entry_update" {
                 // Can't confirm the update without the page.
-                return Ok(Outcome::Unchanged(format!("page unavailable: {e}")));
+                return Ok(Outcome::Unchanged(format!("原文无法获取：{e}")));
             }
-            return Ok(fallback(format!("full text failed: {e}")));
+            return Ok(fallback(format!("全文提取失败：{e}")));
         }
     };
     let html = extract::apply_remove(&extracted.html, &feed.options.remove_selector);
@@ -471,9 +471,9 @@ async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
     let min = settings.fulltext.min_text_chars as usize;
     if got < min.min(entry_len.max(1) * 3) || (entry_len > 300 && got * 2 < entry_len) {
         if rev.reason == "entry_update" {
-            return Ok(Outcome::Unchanged("extracted page too short".into()));
+            return Ok(Outcome::Unchanged("提取的正文过短".into()));
         }
-        return Ok(fallback(format!("full text too short ({got} chars), using feed content")));
+        return Ok(fallback(format!("提取的正文过短（{got} 字），改用订阅内容")));
     }
     let src = ingest::source_text(&html);
     // Confirm that an entry update really changed the article.
@@ -486,9 +486,9 @@ async fn stage_extract(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
         };
         let a = assess_change(old_title.as_deref().unwrap_or(""), old_text.as_deref().unwrap_or(""), &rev.title, &src, &settings.updates);
         if !a.substantive {
-            return Ok(Outcome::Unchanged(format!("page not substantively changed: {}", a.summary)));
+            return Ok(Outcome::Unchanged(format!("原文没有实质修改：{}", a.summary)));
         }
-        app.event(Level::Info, "update", EventRef::story(rev.feed_id, rev.story_id), format!("substantive update confirmed: {}", a.summary)).await;
+        app.event(Level::Info, "update", EventRef::story(rev.feed_id, rev.story_id), format!("确认实质更新：{}", a.summary)).await;
     }
     // Prefer the page's own lead image (usually high resolution) over the feed thumbnail.
     let media = match extracted.image.as_deref().map(str::trim).filter(|i| i.starts_with("http")) {
@@ -542,7 +542,7 @@ async fn stage_transform(app: &AppRef, _settings: &Settings, feed: &FeedRow, rev
     .await??;
     let (html, title, src) = res;
     if html.trim().is_empty() && title.trim().is_empty() {
-        return Ok(Outcome::Failed("empty article".into()));
+        return Ok(Outcome::Failed("文章内容为空".into()));
     }
     Ok(Outcome::Advance(Advance {
         next: next_after_transform(&feed.options),
@@ -573,7 +573,7 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
         if ts.on_failure == "hold" && util::now() - rev.created_at < 72 * 3600 {
             Outcome::Retry { delay: Duration::from_secs(6 * 3600), error: why, count_attempt: false }
         } else {
-            Outcome::Advance(Advance { next, notes: vec![format!("translation failed, published untranslated: {why}")], ..Default::default() })
+            Outcome::Advance(Advance { next, notes: vec![format!("翻译失败，已发布原文：{why}")], ..Default::default() })
         }
     };
 
@@ -581,14 +581,14 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
         Ok(t) if t.complete || last_attempt => {
             let mut notes = Vec::new();
             if t.skipped_same_language {
-                notes.push("translation skipped: already in target language".to_string());
+                notes.push("跳过翻译：已是目标语言".to_string());
             }
             if !t.complete {
-                notes.push(format!("translation incomplete: {} of {} segments kept original text", t.failed_segments, t.total_segments));
-                app.event(Level::Warn, "translate", ev, format!("published partially translated article ({} segments failed)", t.failed_segments)).await;
+                notes.push(format!("翻译不完整：{} / {} 段保留原文", t.failed_segments, t.total_segments));
+                app.event(Level::Warn, "translate", ev, format!("已发布部分翻译的文章（{} 段失败）", t.failed_segments)).await;
             }
             if t.degraded_segments > 0 {
-                notes.push(format!("{} segments lost inline formatting", t.degraded_segments));
+                notes.push(format!("{} 段丢失了行内格式", t.degraded_segments));
             }
             Ok(Outcome::Advance(Advance {
                 next,
@@ -600,18 +600,18 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
         }
         Ok(t) => Ok(Outcome::Retry {
             delay: retry_backoff(rev.attempts),
-            error: format!("incomplete translation ({} of {} segments failed: {})", t.failed_segments, t.total_segments, t.problems.join(", ")),
+            error: format!("翻译不完整（{} / {} 段失败：{}）", t.failed_segments, t.total_segments, t.problems.join(", ")),
             count_attempt: true,
         }),
         Err(TranslateError::CircuitOpen(d)) => Ok(Outcome::Retry {
             delay: d.max(Duration::from_millis(30 * RETRY_UNIT_MS.load(std::sync::atomic::Ordering::Relaxed))),
-            error: "translation service paused (circuit open)".into(),
+            error: "翻译服务暂停中（熔断）".into(),
             count_attempt: false,
         }),
         Err(e) => {
             let msg = e.to_string();
             if last_attempt {
-                app.event(Level::Error, "translate", ev, format!("translation failed after {max_attempts} attempts: {msg}")).await;
+                app.event(Level::Error, "translate", ev, format!("翻译 {max_attempts} 次后仍失败：{msg}")).await;
                 return Ok(give_up(msg));
             }
             let delay = match &e {
@@ -636,12 +636,12 @@ async fn stage_images(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &R
         Ok(r) => {
             let mut notes = Vec::new();
             if r.failed > 0 {
-                notes.push(format!("{} images kept their original URL (download failed)", r.failed));
+                notes.push(format!("{} 张图片下载失败，保留原地址（original URL）", r.failed));
             }
             Ok(Outcome::Advance(Advance { next: "publish", content_html: Some(r.html), notes, ..Default::default() }))
         }
-        Err(e) if rev.attempts < 3 => Ok(Outcome::Retry { delay: retry_backoff(rev.attempts), error: format!("images: {e:#}"), count_attempt: true }),
-        Err(e) => Ok(Outcome::Advance(Advance { next: "publish", notes: vec![format!("image caching failed: {e:#}")], ..Default::default() })),
+        Err(e) if rev.attempts < 3 => Ok(Outcome::Retry { delay: retry_backoff(rev.attempts), error: format!("图片缓存：{e:#}"), count_attempt: true }),
+        Err(e) => Ok(Outcome::Advance(Advance { next: "publish", notes: vec![format!("图片缓存失败：{e:#}")], ..Default::default() })),
     }
 }
 
@@ -840,8 +840,8 @@ async fn stage_publish(app: &AppRef, settings: &Settings, feed: &FeedRow, rev: &
             let mut ev = EventRef::story(rev.feed_id, rev.story_id);
             ev.item_id = Some(p.item_id);
             let msg = match p.previous {
-                Some(old) => format!("published v{} as item {} (replaces item {old}): {}", p.version, p.item_id, util::truncate_chars(&p.title, 120)),
-                None => format!("published item {}: {}", p.item_id, util::truncate_chars(&p.title, 120)),
+                Some(old) => format!("发布第 {} 版（文章 #{}，取代 #{old}）：{}", p.version, p.item_id, util::truncate_chars(&p.title, 120)),
+                None => format!("发布文章 #{}：{}", p.item_id, util::truncate_chars(&p.title, 120)),
             };
             app.event(Level::Info, if p.previous.is_some() { "update" } else { "publish" }, ev, msg).await;
             Ok(Outcome::Gone)
@@ -982,7 +982,7 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
         })
         .await?;
     if created {
-        app.event(Level::Info, "update", EventRef::story(feed_id, story_id), format!("original page changed: {}", a.summary)).await;
+        app.event(Level::Info, "update", EventRef::story(feed_id, story_id), format!("原文页面已更新：{}", a.summary)).await;
         app.wake_pipeline.notify_one();
     }
     Ok(())

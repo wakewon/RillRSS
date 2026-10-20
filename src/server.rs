@@ -146,7 +146,7 @@ pub async fn run(app: AppRef) -> anyhow::Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(app.cfg.listen).await?;
     tracing::info!("RillRSS {} listening on http://{}", env!("CARGO_PKG_VERSION"), listener.local_addr()?);
-    app.event(crate::app::Level::Info, "system", Default::default(), format!("started (v{})", env!("CARGO_PKG_VERSION"))).await;
+    app.event(crate::app::Level::Info, "system", Default::default(), format!("服务启动（v{}）", env!("CARGO_PKG_VERSION"))).await;
     let shutdown = app.shutdown.clone();
     let app2 = app.clone();
     axum::serve(listener, router(app.clone()).into_make_service_with_connect_info::<SocketAddr>())

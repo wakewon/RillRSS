@@ -27,7 +27,7 @@ pub struct CleanupReport {
 impl CleanupReport {
     pub fn summary(&self) -> String {
         format!(
-            "deleted {} articles, {} old versions, {} revisions, {} stories, {} images ({}), {} cached translations, {} events, {} sessions",
+            "删除文章 {}、旧版本 {}、处理记录 {}、新闻条目 {}、图片 {}（{}）、翻译缓存 {}、日志 {}、会话 {}",
             self.items_deleted,
             self.superseded_deleted,
             self.revisions_deleted,
@@ -56,7 +56,7 @@ pub async fn run_maintenance(app: AppRef) {
                     app.event(Level::Info, "cleanup", EventRef::default(), r.summary()).await;
                 }
             }
-            Err(e) => app.event(Level::Error, "cleanup", EventRef::default(), format!("cleanup failed: {e:#}")).await,
+            Err(e) => app.event(Level::Error, "cleanup", EventRef::default(), format!("清理失败：{e:#}")).await,
         }
     }
 }
