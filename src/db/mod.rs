@@ -23,8 +23,7 @@ fn init_conn(conn: &mut Connection) -> rusqlite::Result<()> {
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
          PRAGMA temp_store = MEMORY;
-         PRAGMA cache_size = -16000;
-         PRAGMA mmap_size = 134217728;",
+         PRAGMA cache_size = -8000;",
     )?;
     Ok(())
 }
@@ -44,7 +43,7 @@ impl Db {
             )
             .with_init(init_conn);
         let pool = r2d2::Pool::builder()
-            .max_size(12)
+            .max_size(8)
             .min_idle(Some(1))
             .connection_timeout(Duration::from_secs(30))
             .build(manager)
@@ -90,6 +89,23 @@ impl Db {
             Ok(out)
         })
         .await
+    }
+
+    /// Consistent online backup of the database to `dest` (SQLite backup API).
+    pub fn backup_to(&self, dest: &Path) -> Result<()> {
+        let conn = self.conn()?;
+        let mut out = Connection::open(dest).with_context(|| format!("open {}", dest.display()))?;
+        let backup = rusqlite::backup::Backup::new(&conn, &mut out)?;
+        backup.run_to_completion(256, Duration::from_millis(10), None)?;
+        Ok(())
+    }
+
+    /// `PRAGMA integrity_check` result ("ok" when healthy).
+    pub fn integrity_check(&self) -> Result<String> {
+        let conn = self.conn()?;
+        let mut st = conn.prepare("PRAGMA integrity_check")?;
+        let rows: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        Ok(rows.join("\n"))
     }
 
     /// Size in bytes of the main database file plus WAL.
@@ -154,5 +170,11 @@ mod tests {
         assert_eq!(v, MIGRATIONS.len() as i64);
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
+        drop(conn);
+        assert_eq!(db.integrity_check().unwrap(), "ok");
+        let dest = dir.path().join("backup.db");
+        db.backup_to(&dest).unwrap();
+        let copy = Db::open(&dest).unwrap();
+        assert_eq!(copy.integrity_check().unwrap(), "ok");
     }
 }

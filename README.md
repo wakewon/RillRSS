@@ -116,9 +116,11 @@ location / {
 ## 运维
 
 - **健康检查**：`GET /healthz`；镜像内置 `HEALTHCHECK`（`rillrss healthcheck`）。
-- **备份**：停止容器后复制 `./data` 目录；或在运行中使用 `sqlite3 data/rillrss.db ".backup backup.db"`（WAL 模式）。OPML 导出也包含所有订阅与处理选项。
+- **备份**：运行中可执行 `docker compose exec rillrss entrypoint.sh backup /data/backup-$(date +%F).db`（SQLite 在线备份，得到一致的快照）；或停止容器后复制 `./data` 目录。OPML 导出也包含所有订阅与处理选项。
+- **完整性检查**：`docker compose exec rillrss entrypoint.sh check-db`（输出 `ok` 表示正常）。
+- **不要在容器运行时用宿主机上的工具直接打开数据库**：SQLite 的 WAL 模式依赖共享内存，宿主机与容器（尤其是 Docker Desktop 的虚拟机文件共享、NAS、网络文件系统）同时访问可能损坏数据库。请使用上面的备份命令。
 - **升级**：`git pull && docker compose up -d --build`；数据库自动迁移。
-- **重置密码**：`docker compose exec rillrss rillrss reset-password 新密码`。
+- **重置密码**：`docker compose exec rillrss entrypoint.sh reset-password 新密码`（通过 `entrypoint.sh` 执行可保证以服务用户身份运行）。
 - **清理**：每小时自动执行（文章保留天数、每订阅上限、旧版本、过期翻译缓存、无引用图片、日志），也可在「任务」页手动执行。收藏永不删除。
 - **日志**：`docker compose logs -f rillrss`；后台「日志」页记录抓取、更新、翻译、发布等事件。
 

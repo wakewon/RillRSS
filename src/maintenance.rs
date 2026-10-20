@@ -142,6 +142,18 @@ pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
         })
         .await?;
 
+    // Drop change-detection baselines of stories past the update-tracking window.
+    let track = settings.updates.track_hours.max(1) as i64;
+    let baseline_cutoff = now - track * 3600 - 86400;
+    app.db
+        .write(move |tx| {
+            Ok(tx.execute(
+                "UPDATE stories SET source_text = NULL, next_check_at = NULL WHERE first_seen_at < ? AND source_text IS NOT NULL",
+                [baseline_cutoff],
+            )?)
+        })
+        .await?;
+
     // Image cache.
     let (n, freed) = app.images.gc(86400).await?;
     report.images_deleted = n;

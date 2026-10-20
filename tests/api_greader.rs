@@ -135,9 +135,11 @@ async fn item_ids_contents_and_pagination() {
     assert_eq!(a["items"], b["items"]);
     assert_eq!(a["items"], c2["items"]);
     assert!(a["continuation"].is_string());
-    // r=o oldest first
+    // r=o: oldest (smallest id / earliest insertion) first
+    let all = t.gr_get(&auth, "stream/items/ids?output=json&s=user/-/state/com.google/reading-list&n=100").await;
+    let min_id: i64 = all["itemRefs"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().parse::<i64>().unwrap()).min().unwrap();
     let o = t.gr_get(&auth, "stream/contents/user/-/state/com.google/reading-list?r=o&n=1").await;
-    assert_eq!(o["items"][0]["title"], "Item 0");
+    assert_eq!(o["items"][0]["id"], format!("tag:google.com,2005:reader/item/{min_id:016x}"));
 }
 
 #[tokio::test]

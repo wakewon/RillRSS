@@ -823,7 +823,7 @@ fn publish_tx(tx: &Transaction, settings: &Settings, feed: &FeedRow, rev: &Rev) 
         ],
     )?;
     tx.execute(
-        "UPDATE revisions SET state = 'published', stage = 'done', item_id = ?, lease_until = NULL, content_html = NULL, updated_at = ? WHERE id = ?",
+        "UPDATE revisions SET state = 'published', stage = 'done', item_id = ?, lease_until = NULL, content_html = NULL, source_text = NULL, updated_at = ? WHERE id = ?",
         params![item_id, now, rev.id],
     )?;
     Ok(Some(PublishInfo { item_id, version: new_version, title, previous }))
@@ -929,6 +929,7 @@ async fn check_story_page(app: &AppRef, settings: &Settings, feed_id: i64, story
         }
     };
     let eligible = version > 0
+        && source_text.is_some()
         && feed.options.updates == UpdateMode::Page
         && feed.options.fulltext != FulltextMode::Off
         && (settings.updates.max_versions == 0 || version < settings.updates.max_versions as i64);

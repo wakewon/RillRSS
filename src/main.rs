@@ -28,6 +28,13 @@ enum Cmd {
         /// The new password.
         password: String,
     },
+    /// Write a consistent copy of the database (safe while the server is running).
+    Backup {
+        /// Destination file, e.g. /data/backup-2026-10-20.db
+        dest: std::path::PathBuf,
+    },
+    /// Run SQLite's integrity check on the database.
+    CheckDb,
 }
 
 fn init_tracing() {
@@ -73,6 +80,32 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Cmd::Backup { dest }) => {
+            if dest.exists() {
+                eprintln!("error: {} already exists", dest.display());
+                return ExitCode::FAILURE;
+            }
+            match rillrss::db::Db::open(&cli.cfg.db_path()).and_then(|db| db.backup_to(&dest)) {
+                Ok(()) => {
+                    println!("backup written to {}", dest.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(Cmd::CheckDb) => match rillrss::db::Db::open(&cli.cfg.db_path()).and_then(|db| db.integrity_check()) {
+            Ok(r) => {
+                println!("{r}");
+                if r == "ok" { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
         None | Some(Cmd::Serve) => {
             init_tracing();
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");

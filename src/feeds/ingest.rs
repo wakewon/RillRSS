@@ -308,7 +308,9 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
                 // Published story: is it eligible for an update?
                 let too_old = us.track_hours > 0 && s.first_seen_at < now - us.track_hours as i64 * 3600;
                 let max_reached = us.max_versions > 0 && s.version >= us.max_versions as i64;
-                if !track_updates || too_old || max_reached || s.state != "active" {
+                // Without a baseline (dropped after the tracking window) nothing can be compared.
+                let no_baseline = s.source_text.is_none();
+                if !track_updates || too_old || max_reached || no_baseline || s.state != "active" {
                     report.ignored_changes += 1;
                     continue;
                 }
