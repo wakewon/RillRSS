@@ -213,7 +213,7 @@ pub fn ingest_entries(tx: &Transaction, ctx: &IngestContext, entries: &[ParsedEn
     let mut process_allowed: HashSet<String> = HashSet::new();
     if existing == 0 && fetch.initial_items > 0 {
         let mut by_date: Vec<&Prepared> = prepared.iter().collect();
-        by_date.sort_by(|a, b| b.published.cmp(&a.published));
+        by_date.sort_by_key(|p| std::cmp::Reverse(p.published));
         for p in by_date.into_iter().take(fetch.initial_items as usize) {
             process_allowed.insert(p.gkey.clone());
         }

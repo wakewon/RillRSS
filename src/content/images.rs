@@ -282,9 +282,10 @@ impl ImageStore {
             v.truncate(cfg.max_per_article.max(1) as usize);
             v
         };
-        let mut results: HashMap<String, Result<(String, String, Option<u32>, Option<u32>)>> = HashMap::new();
+        type Fetched = Result<(String, String, Option<u32>, Option<u32>)>;
+        let mut results: HashMap<String, Fetched> = HashMap::new();
         let conc = cfg.concurrency.max(1) as usize;
-        let fetched: Vec<(String, Result<(String, String, Option<u32>, Option<u32>)>)> = futures::stream::iter(urls)
+        let fetched: Vec<(String, Fetched)> = futures::stream::iter(urls)
             .map(|u| async move {
                 let r = self.fetch_one(http, cfg, &u, referer, user_agent).await;
                 (u, r)

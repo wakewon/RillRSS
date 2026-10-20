@@ -205,11 +205,7 @@ fn scan_item_images(body: &[u8]) -> Vec<Option<String>> {
     let mut depth_in_item: Option<usize> = None;
     let mut depth = 0usize;
     let mut buf = Vec::new();
-    loop {
-        let ev = match reader.read_event_into(&mut buf) {
-            Ok(e) => e,
-            Err(_) => break,
-        };
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let is_empty = matches!(ev, Event::Empty(_));

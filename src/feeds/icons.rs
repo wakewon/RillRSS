@@ -93,7 +93,7 @@ async fn fetch_icon(app: &AppRef, site: &str, feed_image: Option<&str>) -> Resul
                 links.push((score, u));
             }
         }
-        links.sort_by(|a, b| b.0.cmp(&a.0));
+        links.sort_by_key(|l| std::cmp::Reverse(l.0));
         candidates.extend(links.into_iter().map(|(_, u)| u));
     }
     if let Ok(u) = base.join("/favicon.ico") {

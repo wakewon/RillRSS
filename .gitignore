@@ -4,6 +4,7 @@
 
 # Build output
 /target/
+/dist/
 **/*.rs.bk
 
 # Runtime data directory (SQLite DB, image cache, icons, backups ...)

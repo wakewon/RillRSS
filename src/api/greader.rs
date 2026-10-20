@@ -1056,10 +1056,10 @@ mod tests {
 
     #[test]
     fn ts_units() {
-        assert_eq!(ts_to_us(Some("1792483200")), Some(1792483200_000_000));
-        assert_eq!(ts_to_us(Some("1792483200123")), Some(1792483200_123_000));
-        assert_eq!(ts_to_us(Some("1792483200123456")), Some(1792483200_123_456));
-        assert_eq!(ts_to_us(Some("1792483200123456789")), Some(1792483200_123_456));
+        assert_eq!(ts_to_us(Some("1792483200")), Some(1_792_483_200_000_000));
+        assert_eq!(ts_to_us(Some("1792483200123")), Some(1_792_483_200_123_000));
+        assert_eq!(ts_to_us(Some("1792483200123456")), Some(1_792_483_200_123_456));
+        assert_eq!(ts_to_us(Some("1792483200123456789")), Some(1_792_483_200_123_456));
         assert_eq!(ts_to_us(Some("0")), None);
         assert_eq!(parse_secs(Some("1792483200123")), Some(1792483200));
     }
