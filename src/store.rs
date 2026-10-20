@@ -30,6 +30,8 @@ pub struct ItemQuery {
     /// Some(Some(id)) = category id, Some(None) = uncategorized.
     pub category: Option<Option<i64>>,
     pub label_id: Option<i64>,
+    /// Items carrying any label.
+    pub any_label: bool,
     pub read: Option<bool>,
     pub starred: Option<bool>,
     pub published_flag: Option<bool>,
@@ -44,9 +46,13 @@ pub struct ItemQuery {
     /// Keyset / id bounds (exclusive).
     pub id_gt: Option<i64>,
     pub id_lt: Option<i64>,
+    /// One bound variable per id: callers pass client lists in chunks (SQLite allows
+    /// 32,766 variables per statement).
     pub id_in: Option<Vec<i64>>,
     pub search: Option<String>,
     pub order: Order,
+    /// Unread items first, each group in `order`.
+    pub unread_first: bool,
     pub limit: Option<usize>,
     pub offset: usize,
 }
@@ -77,6 +83,9 @@ impl ItemQuery {
         if let Some(l) = self.label_id {
             w.push("i.id IN (SELECT item_id FROM item_labels WHERE label_id = ?)".into());
             p.push(Value::Integer(l));
+        }
+        if self.any_label {
+            w.push("i.id IN (SELECT item_id FROM item_labels)".into());
         }
         if let Some(r) = self.read {
             w.push(format!("i.is_read = {}", r as i64));
@@ -138,14 +147,15 @@ impl ItemQuery {
         (sql, p)
     }
 
-    fn order_sql(&self) -> &'static str {
-        match self.order {
+    fn order_sql(&self) -> String {
+        let order = match self.order {
             Order::IdDesc => "i.id DESC",
             Order::IdAsc => "i.id ASC",
             Order::PublishedDesc => "i.published_at DESC, i.id DESC",
             Order::PublishedAsc => "i.published_at ASC, i.id ASC",
             Order::TitleAsc => "i.title COLLATE NOCASE ASC, i.id ASC",
-        }
+        };
+        if self.unread_first { format!("i.is_read ASC, {order}") } else { order.to_string() }
     }
 
     pub fn ids(&self, conn: &Connection) -> Result<Vec<i64>> {
@@ -465,10 +475,11 @@ pub struct LabelInfo {
 }
 
 pub fn list_labels(conn: &Connection) -> Result<Vec<LabelInfo>> {
+    // Hidden (superseded) copies keep their labels but are not listed: not counted either.
     let mut st = conn.prepare(
         "SELECT l.id, l.name,
                 (SELECT COUNT(*) FROM item_labels il JOIN items i ON i.id = il.item_id WHERE il.label_id = l.id AND i.is_read = 0 AND i.hidden = 0),
-                (SELECT COUNT(*) FROM item_labels il WHERE il.label_id = l.id)
+                (SELECT COUNT(*) FROM item_labels il JOIN items i ON i.id = il.item_id WHERE il.label_id = l.id AND i.hidden = 0)
          FROM labels l ORDER BY l.name COLLATE NOCASE",
     )?;
     let v = st
@@ -535,6 +546,12 @@ mod tests {
         assert_eq!(star, vec![5]);
         let search = ItemQuery { search: Some("title 3".into()), ..Default::default() }.ids(&c).unwrap();
         assert_eq!(search, vec![4]);
+        // Read: 1, 4, 7, 10. Unread first, then by id; pages cut that whole order.
+        let page = ItemQuery { unread_first: true, limit: Some(3), offset: 5, ..Default::default() }.ids(&c).unwrap();
+        assert_eq!(page, vec![2, 10, 7]);
+        let l = ensure_label(&c, "Later").unwrap();
+        set_label(&c, &[2, 9], l, true).unwrap();
+        assert_eq!(ItemQuery { any_label: true, ..Default::default() }.ids(&c).unwrap(), vec![9, 2]);
     }
 
     #[test]

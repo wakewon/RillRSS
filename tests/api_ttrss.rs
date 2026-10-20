@@ -184,3 +184,107 @@ async fn subscribe_and_unsubscribe() {
     let invalid = t.tt_op(&sid, json!({"op": "subscribeToFeed", "feed_url": "not a url"})).await;
     assert_eq!(invalid["status"]["code"], 2);
 }
+
+/// An oversized request is refused from its declared length with an API error (413).
+#[tokio::test]
+async fn oversized_request_gets_an_api_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_m, t, _sid) = setup().await;
+    let host = t.base.trim_start_matches("http://");
+    let mut s = tokio::net::TcpStream::connect(host).await.unwrap();
+    // Like curl: wait for `100 Continue` before sending the body, which never comes.
+    let head = format!("POST /api/ HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n", 600 << 10);
+    s.write_all(head.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), s.read_to_end(&mut out)).await.expect("server waited for the body").unwrap();
+    let r = String::from_utf8_lossy(&out);
+    assert!(r.starts_with("HTTP/1.1 413"), "{r}");
+    assert!(r.contains(r#"{"seq":0,"status":1,"content":{"error":"INCORRECT_USAGE"}}"#), "{r}");
+}
+
+/// Counters agree with the lists about hidden superseded copies and include feeds
+/// without items; skip pages without a limit; unread-first pages in SQL; absurd ids
+/// do not overflow.
+#[tokio::test]
+async fn counters_paging_and_extreme_ids() {
+    let (_m, t, sid) = setup().await;
+    let ids: Vec<i64> = t
+        .app
+        .db
+        .call(|c| {
+            let mut st = c.prepare("SELECT id FROM items ORDER BY id")?;
+            Ok(st.query_map([], |r| r.get(0))?.collect::<Result<Vec<i64>, _>>()?)
+        })
+        .await
+        .unwrap();
+    let (old, new) = (ids[0], ids[3]);
+    // A read, starred, labeled article reprocessed: `new` inherits everything, `old` is
+    // hidden but keeps its star and label.
+    t.app
+        .db
+        .call(move |c| {
+            c.execute("INSERT INTO labels (name, created_at) VALUES ('Later', 0)", [])?;
+            c.execute("UPDATE items SET is_read = 1, is_starred = 1 WHERE id IN (?1, ?2)", [old, new])?;
+            c.execute("UPDATE items SET hidden = 1, superseded_by = ?2 WHERE id = ?1", [old, new])?;
+            c.execute("INSERT INTO item_labels (item_id, label_id) VALUES (?1, 1), (?2, 1)", [old, new])?;
+            c.execute("INSERT INTO feeds (url, title, created_at, updated_at) VALUES ('http://127.0.0.1:1/empty.xml', 'Empty', 0, 0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let counters = t.tt_op(&sid, json!({"op": "getCounters"})).await;
+    let find = |id: i64, cat: bool| counters.as_array().unwrap().iter().find(|c| c["id"] == id && c.get("kind").is_some() == cat).cloned().unwrap();
+    assert_eq!(find(-1, false)["auxcounter"], 1);
+    assert_eq!(find(1, false)["markedcounter"], 1, "hidden copy not counted per feed");
+    assert_eq!(find(1, true)["markedcounter"], 1, "nor per category");
+    assert_eq!(find(-1026, false)["auxcounter"], 1, "nor per label");
+    assert_eq!(find(2, false)["counter"], 0, "a feed without items is listed");
+    let labeled = t.tt_op(&sid, json!({"op": "getHeadlines", "feed_id": -2, "is_cat": true})).await;
+    assert_eq!(labeled.as_array().unwrap().iter().map(|h| h["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![new]);
+    // Unread first across pages: the two unread, then the read one.
+    let mut order = Vec::new();
+    for skip in 0..4 {
+        let page = t.tt_op(&sid, json!({"op": "getCompactHeadlines", "feed_id": -4, "view_mode": "unread_first", "limit": 1, "skip": skip})).await;
+        order.extend(page.as_array().unwrap().iter().map(|x| x["id"].as_i64().unwrap()));
+    }
+    assert_eq!(order, vec![ids[2], ids[1], new]);
+    // A negative limit means none; skip still applies.
+    let rest = t.tt_op(&sid, json!({"op": "getHeadlines", "feed_id": -4, "limit": -1, "skip": 1})).await;
+    assert_eq!(rest.as_array().unwrap().iter().map(|h| h["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![ids[2], ids[1]]);
+    // i64::MIN ids (debug builds panicked).
+    let r = t.tt_op(&sid, json!({"op": "setArticleLabel", "article_ids": new.to_string(), "label_id": i64::MIN, "assign": true})).await;
+    assert_eq!(r["updated"], 0);
+    assert_eq!(t.tt_op(&sid, json!({"op": "getHeadlines", "feed_id": i64::MIN})).await, json!([]));
+    assert_eq!(t.tt_op(&sid, json!({"op": "catchupFeed", "feed_id": i64::MIN.to_string()})).await["status"], "OK");
+}
+
+/// Many labeled items: "any label" views are subqueries, not one bound variable per
+/// item (SQLite allows 32,766), and long id lists from clients are chunked.
+#[tokio::test]
+async fn many_labeled_items() {
+    let (_m, t, sid) = setup().await;
+    t.app
+        .db
+        .call(|c| {
+            c.execute_batch(
+                "INSERT INTO labels (name, created_at) VALUES ('Bulk', 0);
+                 WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 33000)
+                 INSERT INTO items (feed_id, guid, title, content, published_at, updated_at, created_at)
+                 SELECT 1, 'bulk' || x, 'Bulk ' || x, '<p>b</p>', x, x, x FROM n;
+                 INSERT INTO item_labels (item_id, label_id) SELECT id, 1 FROM items WHERE guid LIKE 'bulk%';",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let counters = t.tt_op(&sid, json!({"op": "getCounters"})).await;
+    assert!(counters.as_array().unwrap().iter().any(|c| c["id"] == -2 && c["kind"] == "cat" && c["counter"] == 33000));
+    let cats = t.tt_op(&sid, json!({"op": "getCategories"})).await;
+    assert!(cats.as_array().unwrap().iter().any(|c| c["id"] == -2 && c["unread"] == 33000));
+    let all = t.tt_op(&sid, json!({"op": "getCompactHeadlines", "feed_id": -4, "view_mode": "unread_first"})).await;
+    let ids: Vec<i64> = all.as_array().unwrap().iter().map(|x| x["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids.len(), 33004);
+    let r = t.tt_op(&sid, json!({"op": "updateArticle", "article_ids": ids, "mode": 0, "field": 2})).await;
+    assert_eq!(r["updated"], 33004);
+    assert_eq!(t.tt_op(&sid, json!({"op": "getUnread"})).await["unread"], 0);
+}

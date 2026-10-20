@@ -278,3 +278,92 @@ async fn login_throttle_cannot_be_dodged() {
     // ...while another client still gets in.
     assert_eq!(login("8.8.8.8".into(), "password123").await, 200);
 }
+
+/// Send the headers of a POST that declares a `len`-byte body and waits for
+/// `100 Continue` before sending it (as curl does); returns the raw response.
+async fn post_declared(t: &TestApp, path: &str, len: usize, extra_headers: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host = t.base.trim_start_matches("http://");
+    let mut s = tokio::net::TcpStream::connect(host).await.unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {len}\r\nExpect: 100-continue\r\n{extra_headers}\r\n"
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), s.read_to_end(&mut out)).await.expect("server waited for the body").unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Bodies are limited per request (an OPML import may be larger), and credentials that
+/// are not in the body are checked before it is read.
+#[tokio::test]
+async fn request_bodies_are_limited() {
+    let (_m, t, auth) = setup().await;
+    let good = format!("Authorization: GoogleLogin auth={auth}\r\n");
+    let bad = "Authorization: GoogleLogin auth=nope\r\n";
+    // Too large: refused from the declared length, never a 500.
+    for (path, len, headers) in [
+        ("/reader/api/0/edit-tag", 3 << 20, good.as_str()),
+        ("/reader/api/0/edit-tag", 3 << 20, ""),
+        ("/accounts/ClientLogin", 100 << 10, ""),
+        ("/api/greader.php/reader/api/0/subscription/import", 17 << 20, good.as_str()),
+    ] {
+        let r = post_declared(&t, path, len, headers).await;
+        assert!(r.starts_with("HTTP/1.1 413"), "{path}: {r}");
+    }
+    // A wrong token, or an import without any credentials, is refused before the body.
+    for (path, headers) in [("/reader/api/0/edit-tag", bad), ("/reader/api/0/subscription/import", bad), ("/reader/api/0/subscription/import", "")] {
+        let r = post_declared(&t, path, 1 << 20, headers).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{path}: {r}");
+    }
+    // An OPML import may exceed the general 2 MiB.
+    let opml = format!(
+        "<?xml version=\"1.0\"?><opml version=\"2.0\"><head><title>x</title></head><body><!-- {} --><outline type=\"rss\" text=\"Big\" xmlUrl=\"https://big.example.com/rss\"/></body></opml>",
+        "x".repeat(3 << 20)
+    );
+    let r = t
+        .client
+        .post(t.url("/reader/api/0/subscription/import"))
+        .header("Authorization", format!("GoogleLogin auth={auth}"))
+        .header("Content-Type", "text/xml")
+        .body(opml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(t.count("SELECT COUNT(*) FROM feeds WHERE url = 'https://big.example.com/rss'").await, 1);
+}
+
+/// `user/-/label/<name>` resolves to a folder before a label: tagging with a folder's name
+/// creates no label, and a label later shadowed by a new folder is not listed twice.
+#[tokio::test]
+async fn labels_never_shadow_folders() {
+    let (_m, t, auth) = setup().await;
+    let ids = t.gr_get(&auth, "stream/items/ids?output=json&s=user/-/state/com.google/reading-list").await;
+    let first = ids["itemRefs"][0]["id"].as_str().unwrap().to_string();
+    t.gr_post(&auth, "edit-tag", &[("i", &first), ("a", "user/-/label/tech"), ("a", "user/-/label/Uncategorized")]).await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM labels").await, 0);
+    // Label "World" first, then a folder of the same name.
+    t.gr_post(&auth, "edit-tag", &[("i", &first), ("a", "user/-/label/World")]).await;
+    assert_eq!(t.gr_post(&auth, "subscription/edit", &[("ac", "edit"), ("s", "feed/1"), ("a", "user/-/label/World")]).await.0, 200);
+    let uc = t.gr_get(&auth, "unread-count?output=json").await;
+    let world: Vec<&Value> = uc["unreadcounts"].as_array().unwrap().iter().filter(|x| x["id"] == "user/-/label/World").collect();
+    assert_eq!(world.len(), 1, "{uc}");
+    assert_eq!(world[0]["count"], 5, "the folder's count");
+    let tags = t.gr_get(&auth, "tag/list?output=json").await;
+    assert_eq!(tags["tags"].as_array().unwrap().iter().filter(|x| x["id"] == "user/-/label/World").count(), 1);
+    // `it=` resolves like `s=`: the folder (5 items), not the shadowed label (1).
+    let v = t.gr_get(&auth, "stream/items/ids?output=json&s=user/-/state/com.google/reading-list&it=user/-/label/World").await;
+    assert_eq!(v["itemRefs"].as_array().unwrap().len(), 5);
+}
+
+/// Extreme numbers must not overflow (debug builds panicked on these).
+#[tokio::test]
+async fn extreme_parameters_do_not_overflow() {
+    let (_m, t, auth) = setup().await;
+    assert_eq!(t.gr_get(&auth, "stream/items/count?s=user/-/state/com.google/reading-list").await, json!(5));
+    let all = t.gr_get(&auth, "stream/items/ids?output=json&s=user/-/state/com.google/reading-list&nt=1e19").await;
+    assert_eq!(all["itemRefs"].as_array().unwrap().len(), 5);
+    let none = t.gr_get(&auth, "stream/items/ids?output=json&s=user/-/state/com.google/reading-list&ot=1e19&it=user/-/state/com.google/read").await;
+    assert_eq!(none["itemRefs"], json!([]));
+}

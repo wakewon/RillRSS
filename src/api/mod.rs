@@ -5,7 +5,10 @@ pub mod ttrss;
 
 use std::net::{IpAddr, SocketAddr};
 
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::body::{Body, Bytes};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use bytes::BytesMut;
+use futures::StreamExt;
 
 use crate::app::App;
 
@@ -93,6 +96,26 @@ fn form_urlencoded_pairs(input: &[u8]) -> Vec<(String, String)> {
     url::form_urlencoded::parse(input).take(MAX_PARAMS).map(|(k, v)| (k.into_owned(), v.into_owned())).collect()
 }
 
+/// Read a request body of at most `limit` bytes (the API handlers choose the limit per
+/// request instead of the router-wide one). Err: 413 when it is larger (refused up
+/// front when Content-Length says so), 400 when it could not be read.
+pub async fn read_body(body: Body, headers: &HeaderMap, limit: usize) -> Result<Bytes, StatusCode> {
+    let declared = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let mut stream = body.into_data_stream();
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if buf.len() + chunk.len() > limit {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
 /// Headers sent on every API response.
 pub fn api_headers(h: &mut HeaderMap) {
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -146,5 +169,18 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", HeaderValue::from_static("8.8.4.4"));
         assert_eq!(forwarded_client_ip(false, &h, Some("127.0.0.1:1".parse().unwrap())), some("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn read_body_limits() {
+        let streamed = || Body::from_stream(futures::stream::iter((0..4).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 1000])))));
+        let none = HeaderMap::new();
+        assert_eq!(read_body(streamed(), &none, 4000).await.unwrap().len(), 4000);
+        // Without Content-Length the limit applies while reading.
+        assert_eq!(read_body(streamed(), &none, 3999).await, Err(StatusCode::PAYLOAD_TOO_LARGE));
+        // A declared length over the limit is refused before reading.
+        let mut declared = HeaderMap::new();
+        declared.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5000"));
+        assert_eq!(read_body(streamed(), &declared, 4000).await, Err(StatusCode::PAYLOAD_TOO_LARGE));
     }
 }

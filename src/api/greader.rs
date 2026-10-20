@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::Response;
@@ -135,6 +135,28 @@ fn label_id_str(name: &str) -> String {
     format!("user/-/label/{name}")
 }
 
+/// Whether `user/-/label/<name>` names a folder (a category, or Uncategorized). Folders
+/// are resolved first, so a label of the same name would be shadowed: it is neither
+/// created nor listed.
+fn folder_named(cats: &[store::CategoryInfo], name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case(UNCATEGORIZED) || cats.iter().any(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+/// Narrow `q` to `user/-/label/<name>`: a folder, else a label. False = neither exists.
+fn label_filter(conn: &Connection, q: &mut ItemQuery, name: &str) -> anyhow::Result<bool> {
+    if let Some(cid) = store::find_category(conn, name)? {
+        q.category = Some(Some(cid));
+    } else if name.trim().eq_ignore_ascii_case(UNCATEGORIZED) {
+        q.category = Some(None);
+    } else if let Some(lid) = store::find_label(conn, name)? {
+        q.label_id = Some(lid);
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Turn a stream into a base query. None = matches nothing.
 fn stream_query(conn: &Connection, stream: &Stream) -> anyhow::Result<Option<ItemQuery>> {
     let mut q = ItemQuery::default();
@@ -152,13 +174,7 @@ fn stream_query(conn: &Connection, stream: &Stream) -> anyhow::Result<Option<Ite
             }
         }
         Stream::Label(name) => {
-            if let Some(cid) = store::find_category(conn, name)? {
-                q.category = Some(Some(cid));
-            } else if name.eq_ignore_ascii_case(UNCATEGORIZED) {
-                q.category = Some(None);
-            } else if let Some(lid) = store::find_label(conn, name)? {
-                q.label_id = Some(lid);
-            } else {
+            if !label_filter(conn, &mut q, name)? {
                 return Ok(None);
             }
         }
@@ -194,19 +210,8 @@ fn apply_filters(conn: &Connection, q: &mut ItemQuery, xt: &[&str], it: &[&str])
             Stream::Read => set(&mut q.read, true),
             Stream::Unread => set(&mut q.read, false),
             Stream::Starred => set(&mut q.starred, true),
-            Stream::Label(name) => match store::find_label(conn, &name)? {
-                Some(l) => {
-                    q.label_id = Some(l);
-                    true
-                }
-                None => match store::find_category(conn, &name)? {
-                    Some(c) => {
-                        q.category = Some(Some(c));
-                        true
-                    }
-                    None => false,
-                },
-            },
+            // Same resolution as the stream itself (folders first).
+            Stream::Label(name) => label_filter(conn, q, &name)?,
             Stream::Feed(f) => {
                 q.feed_ids = Some(vec![f]);
                 true
@@ -254,16 +259,17 @@ fn build_query(conn: &Connection, stream: &Stream, p: &Params, max_n: usize, def
     if !apply_filters(conn, &mut q, &p.all("xt"), &p.all("it"))? {
         return Ok(None);
     }
+    // Saturating: absurd values (`nt=1e19`) must not overflow.
     if let Some(ot) = parse_secs(p.get("ot")) {
-        q.min_created_us = Some((ot - OT_GRACE_SECS) * 1_000_000);
+        q.min_created_us = Some(ot.saturating_sub(OT_GRACE_SECS).saturating_mul(1_000_000));
         if q.read == Some(true) {
             // Read-id queries: also report items marked read since `ot` (e.g. superseded
             // versions of long-running stories).
-            q.or_read_since = Some(ot - OT_GRACE_SECS);
+            q.or_read_since = Some(ot.saturating_sub(OT_GRACE_SECS));
         }
     }
     if let Some(nt) = parse_secs(p.get("nt")) {
-        q.max_created_us = Some(nt * 1_000_000 + 999_999);
+        q.max_created_us = Some(nt.saturating_mul(1_000_000).saturating_add(999_999));
     }
     let asc = p.get("r") == Some("o");
     q.order = if asc { Order::IdAsc } else { Order::IdDesc };
@@ -279,7 +285,8 @@ fn build_query(conn: &Connection, stream: &Stream, p: &Params, max_n: usize, def
         Some(_) => max_n,
         None => default_n,
     };
-    q.limit = Some(n + 1);
+    // One more than asked tells whether there is a next page (`count` passes usize::MAX).
+    q.limit = Some(n.saturating_add(1));
     Ok(Some((q, n)))
 }
 
@@ -356,23 +363,61 @@ pub fn api_path(raw: &str) -> String {
     p
 }
 
+/// Request body limits. Everything but an OPML import is a form of item ids and flags
+/// (at most 20,000 parameters, about 1.4 MB of long-form ids); logins are tiny.
+const MAX_BODY: usize = 2 * 1024 * 1024;
+const MAX_IMPORT_BODY: usize = 16 * 1024 * 1024;
+const MAX_PUBLIC_BODY: usize = 64 * 1024;
+
 pub async fn handle(
     State(app): State<AppRef>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if method == Method::OPTIONS {
         return respond(StatusCode::NO_CONTENT, "text/plain; charset=utf-8", "");
     }
     let path = api_path(uri.path());
     let ctype = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-    let form_body = ctype.is_empty() || ctype.starts_with("application/x-www-form-urlencoded") || ctype.starts_with("text/plain");
     let is_import = path.ends_with("/subscription/import");
-    let params = Params::parse(uri.query(), if form_body && !is_import { Some(&body) } else { None });
-    let resp = route(&app, &method, &path, &params, &headers, peer, &body).await;
+    let form_body = !is_import && (ctype.is_empty() || ctype.starts_with("application/x-www-form-urlencoded") || ctype.starts_with("text/plain"));
+    let public = path.is_empty() || path == "/check/compatibility" || path == "/check%2Fcompatibility" || path == "/accounts/ClientLogin";
+    // Credentials that are not in the body (an Authorization header, or `T` in the query
+    // when the body is no form) are checked before the body is read, so strangers cannot
+    // make the server buffer and parse large bodies.
+    let mut authed = public;
+    if !public {
+        match authenticate(&app, &headers, &Params::parse(uri.query(), None), &method).await {
+            Ok(true) => authed = true,
+            Ok(false) if form_body && method == Method::POST && header_token(&headers).is_none() => {} // `T` may be in the body
+            Ok(false) => return unauthorized(),
+            Err(e) => return server_error(e),
+        }
+    }
+    let limit = if is_import {
+        MAX_IMPORT_BODY
+    } else if public {
+        MAX_PUBLIC_BODY
+    } else {
+        MAX_BODY
+    };
+    let body = match super::read_body(body, &headers, limit).await {
+        Ok(b) => b,
+        Err(StatusCode::PAYLOAD_TOO_LARGE) => return text(StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large!"),
+        Err(_) => return bad_request(),
+    };
+    let params = Params::parse(uri.query(), if form_body { Some(&body) } else { None });
+    if !authed {
+        match authenticate(&app, &headers, &params, &method).await {
+            Ok(true) => {}
+            Ok(false) => return unauthorized(),
+            Err(e) => return server_error(e),
+        }
+    }
+    let resp = route(&app, &path, &params, &headers, peer, &body).await;
     match resp {
         Ok(r) => {
             if method == Method::HEAD {
@@ -386,25 +431,25 @@ pub async fn handle(
     }
 }
 
+/// Token from an `Authorization: GoogleLogin auth=…` or `Bearer …` header.
+fn header_token(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?.trim();
+    let token = if v.len() > 11 && v[..11].eq_ignore_ascii_case("googlelogin") {
+        v[11..].trim().split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("auth")).map(|(_, t)| t)?
+    } else if v.len() > 6 && v[..6].eq_ignore_ascii_case("bearer") {
+        v[6..].trim()
+    } else {
+        return None;
+    };
+    let t = percent_encoding::percent_decode_str(token.trim().trim_matches('"')).decode_utf8_lossy().to_string();
+    // FreshRSS-style "user/token" is accepted too.
+    Some(t.rsplit('/').next().unwrap_or(&t).to_string())
+}
+
 async fn authenticate(app: &App, headers: &HeaderMap, params: &Params, method: &Method) -> anyhow::Result<bool> {
     let expected = auth::greader_token(app).await?;
-    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        let v = v.trim();
-        let token = if v.len() > 11 && v[..11].eq_ignore_ascii_case("googlelogin") {
-            let rest = v[11..].trim();
-            rest.split_once('=').map(|(k, t)| (k.trim().eq_ignore_ascii_case("auth"), t)).filter(|(ok, _)| *ok).map(|(_, t)| t.to_string())
-        } else if v.len() > 6 && v[..6].eq_ignore_ascii_case("bearer") {
-            Some(v[6..].trim().to_string())
-        } else {
-            None
-        };
-        if let Some(t) = token {
-            let t = t.trim().trim_matches('"');
-            let t = percent_encoding::percent_decode_str(t).decode_utf8_lossy().to_string();
-            // FreshRSS-style "user/token" is accepted too.
-            let t = t.rsplit('/').next().unwrap_or(&t).to_string();
-            return Ok(auth::ct_eq(&t, &expected));
-        }
+    if let Some(t) = header_token(headers) {
+        return Ok(auth::ct_eq(&t, &expected));
     }
     // Miniflux style: POST authenticated by T = auth token.
     if *method == Method::POST
@@ -415,7 +460,8 @@ async fn authenticate(app: &App, headers: &HeaderMap, params: &Params, method: &
     Ok(false)
 }
 
-async fn route(app: &AppRef, method: &Method, path: &str, p: &Params, headers: &HeaderMap, peer: SocketAddr, body: &Bytes) -> anyhow::Result<Response> {
+/// Dispatch a request; anything but the public paths is authenticated by `handle`.
+async fn route(app: &AppRef, path: &str, p: &Params, headers: &HeaderMap, peer: SocketAddr, body: &Bytes) -> anyhow::Result<Response> {
     if path.is_empty() {
         return Ok(ok());
     }
@@ -424,9 +470,6 @@ async fn route(app: &AppRef, method: &Method, path: &str, p: &Params, headers: &
     }
     if path == "/accounts/ClientLogin" {
         return client_login(app, p, headers, peer, body).await;
-    }
-    if !authenticate(app, headers, p, method).await? {
-        return Ok(unauthorized());
     }
     if path == "/reader/ping" {
         return Ok(ok());
@@ -588,7 +631,7 @@ async fn tag_list(app: &AppRef) -> anyhow::Result<Response> {
         tags.push(json!({"id": label_id_str(&n), "label": n, "type": "folder"}));
     }
     for l in labels {
-        if cats.iter().any(|c| c.name.eq_ignore_ascii_case(&l.name)) {
+        if folder_named(&cats, &l.name) {
             continue;
         }
         tags.push(json!({"id": label_id_str(&l.name), "label": l.name, "type": "tag", "unread_count": l.unread}));
@@ -648,8 +691,12 @@ async fn unread_count(app: &AppRef) -> anyhow::Result<Response> {
     {
         out.push(json!({"id": label_id_str(prev), "count": cnt, "newestItemTimestampUsec": newest.to_string()}));
     }
-    let labels = app.db.call(|c| store::list_labels(c)).await?;
+    let (labels, cats) = app.db.call(|c| Ok((store::list_labels(c)?, store::list_categories(c)?))).await?;
     for l in labels {
+        // Like tag/list: a shadowed label would repeat a folder's id with another count.
+        if folder_named(&cats, &l.name) {
+            continue;
+        }
         out.push(json!({"id": label_id_str(&l.name), "count": l.unread, "newestItemTimestampUsec": newest_all.to_string()}));
     }
     out.push(json!({"id": READING_LIST, "count": total, "newestItemTimestampUsec": newest_all.to_string()}));
@@ -790,6 +837,7 @@ async fn edit_tag(app: &AppRef, p: &Params) -> anyhow::Result<Response> {
     }
     app.db
         .write(move |tx| {
+            let cats = store::list_categories(tx)?;
             // Removals first so that an add wins over a conflicting remove.
             for s in &removes {
                 match s {
@@ -815,7 +863,9 @@ async fn edit_tag(app: &AppRef, p: &Params) -> anyhow::Result<Response> {
                     Stream::Starred => {
                         store::set_starred(tx, &ids, true)?;
                     }
-                    Stream::Label(name) if !name.trim().is_empty() => {
+                    // A folder's name means the folder (the item's feed decides that), not a
+                    // new label that streams and counts would never show.
+                    Stream::Label(name) if !name.trim().is_empty() && !folder_named(&cats, name) => {
                         let l = store::ensure_label(tx, name)?;
                         store::set_label(tx, &ids, l, true)?;
                     }

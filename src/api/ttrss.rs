@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,9 @@ const SESSION_TTL_SECS: u64 = 30 * 86400;
 const LABEL_BASE: i64 = -1025;
 const FRESH_HOURS: i64 = 24;
 const RECENT_HOURS: i64 = 24;
+/// Requests are small JSON objects (the largest, updateArticle, a list of ids); the
+/// limit bounds what parsing one costs before the session is checked.
+const MAX_BODY: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
 // Parameter coercion (TT-RSS semantics)
@@ -140,8 +143,16 @@ pub async fn handle(
     uri: Uri,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
+    let body = match super::read_body(body, &headers, MAX_BODY).await {
+        Ok(b) => b,
+        Err(status) => {
+            let mut r = err(json!(0), "INCORRECT_USAGE");
+            *r.status_mut() = status;
+            return r;
+        }
+    };
     // JSON body (Content-Type ignored); lenient fallback to form/query parameters.
     let mut map: Map<String, Value> = match serde_json::from_slice::<Value>(&body) {
         Ok(Value::Object(m)) => m,
@@ -265,7 +276,7 @@ async fn dispatch(app: &AppRef, req: &Req, op: &str, seq: Value, headers: &Heade
         "setarticlelabel" => {
             let Some(ids) = req.int_list("article_ids") else { return Ok(err(seq, "INCORRECT_USAGE")) };
             let (label_fid, assign) = (req.int("label_id", 0), req.bool("assign"));
-            let label_id = label_fid.abs() - 1025;
+            let label_id = label_fid.saturating_abs() - 1025;
             let n = app
                 .db
                 .write(move |tx| {
@@ -422,7 +433,7 @@ fn target_of(fid: &Value, is_cat: bool) -> Target {
         };
     };
     if id < LABEL_BASE {
-        return Target::Label(-id + LABEL_BASE); // |id| - 1025
+        return Target::Label(LABEL_BASE - id); // |id| - 1025, no overflow down to i64::MIN
     }
     if is_cat {
         return match id {
@@ -448,7 +459,7 @@ fn target_of(fid: &Value, is_cat: bool) -> Target {
 }
 
 /// Base query for a target. None = empty.
-fn target_query(conn: &Connection, t: &Target) -> anyhow::Result<Option<ItemQuery>> {
+fn target_query(t: &Target) -> Option<ItemQuery> {
     let now = util::now();
     let mut q = ItemQuery::default();
     match t {
@@ -467,22 +478,16 @@ fn target_query(conn: &Connection, t: &Target) -> anyhow::Result<Option<ItemQuer
             q.read_since = Some(now - RECENT_HOURS * 3600);
         }
         Target::Label(l) => q.label_id = Some(*l),
-        Target::AnyLabel => {
-            let ids: Vec<i64> = {
-                let mut st = conn.prepare("SELECT DISTINCT item_id FROM item_labels")?;
-                st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
-            };
-            q.id_in = Some(ids);
-        }
-        Target::Archived | Target::Tag(_) | Target::Nothing => return Ok(None),
+        Target::AnyLabel => q.any_label = true,
+        Target::Archived | Target::Tag(_) | Target::Nothing => return None,
     }
-    Ok(Some(q))
+    Some(q)
 }
 
 fn counter(conn: &Connection, t: &Target) -> anyhow::Result<i64> {
     match t {
         Target::RecentlyRead => Ok(0),
-        _ => match target_query(conn, t)? {
+        _ => match target_query(t) {
             Some(mut q) => {
                 if q.read == Some(true) {
                     return Ok(0);
@@ -549,7 +554,8 @@ fn counters(c: &mut Connection) -> anyhow::Result<Value> {
     }
     let mut starred_by_feed: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     {
-        let mut st = c.prepare("SELECT feed_id, COUNT(*) FROM items WHERE is_starred = 1 GROUP BY feed_id")?;
+        // Hidden superseded copies keep their star but are not listed: like the -1 count.
+        let mut st = c.prepare("SELECT feed_id, COUNT(*) FROM items WHERE is_starred = 1 AND hidden = 0 GROUP BY feed_id")?;
         for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
             let (f, n) = r?;
             starred_by_feed.insert(f, n);
@@ -557,13 +563,12 @@ fn counters(c: &mut Connection) -> anyhow::Result<Value> {
     }
     let mut cat_unread: std::collections::HashMap<i64, (i64, i64)> = std::collections::HashMap::new();
     for f in &feeds {
-        if f.newest_created_us > 0 {
-            out.push(json!({
-                "id": f.id, "title": f.title, "error": f.last_error.clone().unwrap_or_default(), "updated": short_date(f.last_success_at),
-                "counter": f.unread, "markedcounter": starred_by_feed.get(&f.id).copied().unwrap_or(0), "publishedcounter": 0,
-                "ts": 0, "has_img": f.has_icon as i64,
-            }));
-        }
+        // Every feed, also without items: clients keep the last counter they were sent.
+        out.push(json!({
+            "id": f.id, "title": f.title, "error": f.last_error.clone().unwrap_or_default(), "updated": short_date(f.last_success_at),
+            "counter": f.unread, "markedcounter": starred_by_feed.get(&f.id).copied().unwrap_or(0), "publishedcounter": 0,
+            "ts": 0, "has_img": f.has_icon as i64,
+        }));
         let e = cat_unread.entry(f.category_id.unwrap_or(0)).or_insert((0, 0));
         e.0 += f.unread;
         e.1 += starred_by_feed.get(&f.id).copied().unwrap_or(0);
@@ -778,7 +783,7 @@ impl HeadlineParams {
 /// Build the filtered, ordered query for headlines (without limit/skip).
 fn headline_query(c: &Connection, p: &HeadlineParams) -> anyhow::Result<Option<(ItemQuery, Target)>> {
     let t = target_of(&p.feed_id, p.is_cat);
-    let Some(mut q) = target_query(c, &t)? else { return Ok(None) };
+    let Some(mut q) = target_query(&t) else { return Ok(None) };
     match p.view_mode.as_str() {
         "unread" if t != Target::RecentlyRead => q.read = Some(false),
         "marked" => q.starred = Some(true),
@@ -890,7 +895,7 @@ fn get_headlines(c: &mut Connection, p: &HeadlineParams, base: &str) -> anyhow::
     let mut first_id = 0i64;
     if p.search.is_empty() && p.order_by != "date_reverse" {
         let t = target_of(&p.feed_id, p.is_cat);
-        if let Some(mut fq) = target_query(c, &t)? {
+        if let Some(mut fq) = target_query(&t) {
             fq.min_created_us = Some((util::now() - 3600) * 1_000_000);
             if p.since_id > 0 {
                 fq.id_gt = Some(p.since_id);
@@ -905,10 +910,11 @@ fn get_headlines(c: &mut Connection, p: &HeadlineParams, base: &str) -> anyhow::
         header["first_id_changed"] = json!(true);
         return Ok(if p.include_header { json!([header, []]) } else { json!([]) });
     }
+    // A negative limit means no limit (as in TT-RSS); `skip` applies either way.
     if p.limit >= 0 {
         q.limit = Some(if p.limit == 0 || p.limit >= 200 { 200 } else { p.limit as usize });
-        q.offset = p.skip as usize;
     }
+    q.offset = p.skip as usize;
     let ids = q.ids(c)?;
     let items = store::load_items_ordered(c, &ids, p.show_content || p.show_excerpt)?;
     let list: Vec<Value> = items.iter().map(|it| headline(it, p, base)).collect();
@@ -922,15 +928,13 @@ fn compact_headlines(c: &mut Connection, p: &HeadlineParams) -> anyhow::Result<V
         p.view_mode.clear();
     }
     let Some((mut q, _)) = headline_query(c, &p)? else { return Ok(json!([])) };
+    // Sorted in SQL so that limit/skip pages through the whole unread-first order.
+    q.unread_first = unread_first;
     if p.limit > 0 {
         q.limit = Some(p.limit as usize);
-        q.offset = p.skip as usize;
     }
-    let mut ids = q.ids(c)?;
-    if unread_first {
-        let unread: std::collections::HashSet<i64> = ItemQuery { read: Some(false), id_in: Some(ids.clone()), ..Default::default() }.ids(c)?.into_iter().collect();
-        ids.sort_by_key(|id| !unread.contains(id));
-    }
+    q.offset = p.skip as usize;
+    let ids = q.ids(c)?;
     Ok(Value::Array(ids.into_iter().map(|id| json!({"id": id})).collect()))
 }
 
@@ -965,7 +969,13 @@ fn get_article(c: &mut Connection, ids: &[i64], base: &str) -> anyhow::Result<Va
 }
 
 fn update_article(tx: &rusqlite::Transaction, ids: &[i64], mode: i64, field: i64, data: &str) -> anyhow::Result<usize> {
-    let existing: Vec<i64> = ItemQuery { id_in: Some(ids.to_vec()), include_hidden: true, ..Default::default() }.ids(tx)?;
+    // Client lists can be long: look them up in chunks (bound-variable limit).
+    let mut existing: Vec<i64> = Vec::new();
+    for chunk in ids.chunks(500) {
+        existing.extend(ItemQuery { id_in: Some(chunk.to_vec()), include_hidden: true, ..Default::default() }.ids(tx)?);
+    }
+    existing.sort_unstable();
+    existing.dedup(); // a repeated id must not toggle twice
     let items = store::load_items(tx, &existing, false)?;
     match field {
         0..=2 => {
@@ -1004,7 +1014,7 @@ fn catchup(tx: &rusqlite::Transaction, fid: &Value, is_cat: bool, mode: &str) ->
     if is_cat && matches!(t, Target::Starred | Target::Fresh | Target::All) {
         return Ok(());
     }
-    let Some(mut q) = target_query(tx, &t)? else { return Ok(()) };
+    let Some(mut q) = target_query(&t) else { return Ok(()) };
     let now = util::now();
     let older = match mode {
         "1day" => Some(86400),

@@ -49,7 +49,9 @@ pub fn router(app: AppRef) -> Router {
     Router::new()
         .merge(api)
         .merge(crate::web::router())
-        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
+        // For extractors that buffer the body. The reader APIs read bodies themselves with
+        // per-request limits (a GReader OPML import may be larger).
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(app)
