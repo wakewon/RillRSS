@@ -275,6 +275,9 @@ td .sub { color: var(--muted); font-size: 12px; }
 .status.ok { color: var(--ok); }
 .status.warn { color: var(--warn); }
 .status.err { color: var(--err); }
+.engine + .engine { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.engine-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.engine-head .status { margin-left: auto; }
 .callout { margin-top: 14px; padding: 10px 12px; border-radius: var(--radius-sm); font-size: 12.5px; line-height: 1.55; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); word-break: break-word; }
 .callout b { display: block; font-weight: 600; margin-bottom: 2px; color: var(--text); }
 .callout.err { background: var(--err-soft); border-color: transparent; }

@@ -18,6 +18,7 @@ use crate::api::{client_ip, request_base};
 use crate::pipeline::Queued;
 use crate::app::{AppRef, EventRef, Level};
 use crate::auth;
+use crate::content::translate::Engine;
 use crate::content::{convert, extract, sanitize};
 use crate::feeds::fetcher;
 use crate::settings::{FeedOptions, Settings};
@@ -376,18 +377,70 @@ struct Stats {
     username: String,
     api_password: bool,
     tr_configured: bool,
-    tr_model: String,
-    tr_circuit: Option<String>,
-    tr_requests: u64,
-    tr_failures: u64,
-    tr_cache_hits: u64,
-    tr_tokens: u64,
     tr_in_flight: u32,
+    /// The main engine, then the fallback engine.
+    tr_engines: Vec<EngineRow>,
+    /// Some engine is paused or failing (offers "retry now").
+    tr_failing: bool,
+}
+
+#[derive(Default)]
+pub struct EngineRow {
+    name: &'static str,
+    role: &'static str,
+    /// Model (AI translation).
+    model: String,
+    configured: bool,
+    requests: u64,
+    failures: u64,
+    cache_hits: u64,
+    tokens: u64,
     /// "ok" | "err" | "idle" — drives the status dot.
-    tr_state: &'static str,
-    tr_state_label: String,
-    tr_last_error: Option<String>,
-    tr_hint: Option<&'static str>,
+    state: &'static str,
+    state_label: String,
+    last_error: Option<String>,
+    hint: Option<&'static str>,
+}
+
+fn engine_row(app: &crate::app::App, ts: &crate::settings::TranslationSettings, engine: Engine, role: &'static str) -> EngineRow {
+    let configured = engine != Engine::Llm || ts.is_configured();
+    let mut row = EngineRow { name: engine.label(), role, configured, ..Default::default() };
+    if engine == Engine::Llm {
+        row.model = ts.model.clone();
+    }
+    if !configured {
+        (row.state, row.state_label) = ("err", "未配置".into());
+        return row;
+    }
+    let circuit = app.translator.engine_open_for(engine).map(|d| match d.as_secs() {
+        0 => String::new(), // half-open: the probe request is in flight
+        s if s < 90 => format!("{s} 秒"),
+        s => format!("{} 分钟", s.div_ceil(60)),
+    });
+    let st = app.translator.engine_stats(engine);
+    row.requests = st.requests;
+    row.failures = st.failures;
+    row.cache_hits = st.cache_hits;
+    row.tokens = st.prompt_tokens + st.completion_tokens;
+    // Health reflects the latest outcome, not just whether the circuit is open: a
+    // service that fails every request must not show as "正常".
+    let failing = st.last_failed;
+    (row.state, row.state_label) = match &circuit {
+        Some(c) if c.is_empty() => ("err", "已暂停 · 正在试探恢复".into()),
+        Some(c) => ("err", format!("已暂停 · {c}后自动重试")),
+        None if failing => ("err", "最近请求失败".into()),
+        None if st.requests == 0 => ("idle", "待命".into()),
+        None => ("ok", "正常".into()),
+    };
+    let show_error = failing || circuit.is_some();
+    // While paused, show the error that paused translation, not whatever failed last.
+    let (error, hint, at): (Option<String>, _, _) = match (&circuit, st.pause_error) {
+        (Some(_), Some(e)) => (Some(e), st.pause_hint, st.pause_at),
+        _ => (st.last_error, st.last_error_hint, st.last_error_at),
+    };
+    row.last_error = error.filter(|_| show_error).map(|e| format!("{}（{}）", truncate_chars(&e, 240), fmt_relative(at)));
+    row.hint = hint.filter(|_| show_error);
+    row
 }
 
 pub struct EventRow {
@@ -549,37 +602,16 @@ async fn dashboard(State(app): State<AppRef>, headers: HeaderMap, Query(q): Quer
     st.base = base_url;
     st.username = app.cfg.username.clone();
     st.api_password = auth::has_api_password(&app).await.unwrap_or(false);
-    st.tr_configured = settings.translation.is_configured();
-    st.tr_model = settings.translation.model.clone();
-    st.tr_circuit = app.translator.circuit_open_for().map(|d| match d.as_secs() {
-        0 => String::new(), // half-open: the probe request is in flight
-        s if s < 90 => format!("{s} 秒"),
-        s => format!("{} 分钟", s.div_ceil(60)),
-    });
-    let ts = app.translator.stats();
-    st.tr_requests = ts.requests;
-    st.tr_failures = ts.failures;
-    st.tr_cache_hits = ts.cache_hits;
-    st.tr_tokens = ts.prompt_tokens + ts.completion_tokens;
+    let ts = &settings.translation;
+    st.tr_configured = ts.is_usable();
     st.tr_in_flight = app.translator.in_flight();
-    // Health reflects the latest outcome, not just whether the circuit is open: a
-    // service that fails every request must not show as "正常".
-    let failing = ts.last_failed;
-    (st.tr_state, st.tr_state_label) = match &st.tr_circuit {
-        Some(c) if c.is_empty() => ("err", "已暂停 · 正在试探恢复".into()),
-        Some(c) => ("err", format!("已暂停 · {c}后自动重试")),
-        None if failing => ("err", "最近请求失败".into()),
-        None if ts.requests == 0 => ("idle", "待命".into()),
-        None => ("ok", "正常".into()),
-    };
-    let show_error = failing || st.tr_circuit.is_some();
-    // While paused, show the error that paused translation, not whatever failed last.
-    let (error, hint, at) = match (&st.tr_circuit, ts.pause_error) {
-        (Some(_), Some(e)) => (Some(e), ts.pause_hint, ts.pause_at),
-        _ => (ts.last_error, ts.last_error_hint, ts.last_error_at),
-    };
-    st.tr_last_error = error.filter(|_| show_error).map(|e| format!("{}（{}）", truncate_chars(&e, 240), fmt_relative(at)));
-    st.tr_hint = hint.filter(|_| show_error);
+    if let Some(main) = Engine::parse(&ts.engine) {
+        st.tr_engines.push(engine_row(&app, ts, main, "主引擎"));
+    }
+    if let Some(fb) = ts.fallback_engine().and_then(Engine::parse) {
+        st.tr_engines.push(engine_row(&app, ts, fb, "回退"));
+    }
+    st.tr_failing = st.tr_engines.iter().any(|r| r.configured && r.state == "err");
     let queue_total: i64 = stages.iter().map(|r| r.due + r.waiting).sum();
     let max = stages.iter().map(|r| r.due + r.waiting).max().unwrap_or(0).max(1);
     for r in &mut stages {
@@ -1684,6 +1716,8 @@ struct SettingsT {
     sections: Vec<Section>,
 }
 
+const ENGINE_OPTIONS: &[(&str, &str)] = &[("llm", "AI 翻译（OpenAI 兼容接口）"), ("google", "Google 翻译（免费）"), ("microsoft", "微软翻译（免费）")];
+
 fn settings_sections(s: &Settings) -> Vec<Section> {
     let n = |name: &str, label: &str, v: &dyn ToString, help: &str| field(name, label, "number", v.to_string(), help);
     let t = |name: &str, label: &str, v: &str, help: &str| field(name, label, "text", v, help);
@@ -1725,8 +1759,33 @@ fn settings_sections(s: &Settings) -> Vec<Section> {
         },
         Section {
             id: "translation".into(),
+            title: "翻译引擎".into(),
+            help: "Google 翻译和微软翻译免费、无需 Key，速度快；AI 翻译质量更好，可附加术语表和风格要求。回退引擎补译主引擎翻译失败或被内容审核拒绝的段落；主引擎在最后一次尝试仍失败、已暂停或未配置时，整篇改用回退引擎。".into(),
+            fields: vec![
+                select("translation.engine", "主引擎", &s.translation.engine, ENGINE_OPTIONS, ""),
+                select(
+                    "translation.fallback",
+                    "回退引擎",
+                    &s.translation.fallback,
+                    &[("none", "不使用"), ENGINE_OPTIONS[0], ENGINE_OPTIONS[1], ENGINE_OPTIONS[2]],
+                    "与主引擎相同时视为不使用",
+                ),
+                n("translation.mt_max_concurrency", "Google / 微软最大并发请求", &s.translation.mt_max_concurrency, "每个引擎分别计算"),
+                n("translation.mt_requests_per_minute", "Google / 微软每分钟请求上限", &s.translation.mt_requests_per_minute, "0 表示不限制；过高可能被临时限流"),
+                n("translation.max_attempts", "每篇最多尝试次数", &s.translation.max_attempts, "超过后先改用回退引擎，仍失败再按失败策略处理"),
+                select(
+                    "translation.on_failure",
+                    "失败策略",
+                    &s.translation.on_failure,
+                    &[("publish_original", "发布原文（附说明）"), ("hold", "继续等待（最长 72 小时）")],
+                    "",
+                ),
+            ],
+        },
+        Section {
+            id: "llm".into(),
             title: "AI 翻译（OpenAI 兼容接口）".into(),
-            help: "支持 OpenAI、DeepSeek、通义千问、硅基流动、OpenRouter、Ollama、vLLM 等。".into(),
+            help: "支持 OpenAI、DeepSeek、通义千问、智谱、硅基流动、OpenRouter、Ollama、vLLM 等。".into(),
             fields: vec![
                 t("translation.base_url", "API 地址", &s.translation.base_url, "如 https://api.openai.com/v1、https://api.deepseek.com/v1、http://ollama:11434/v1"),
                 field("translation.api_key", "API Key", "password", if s.translation.api_key.is_empty() { "" } else { "set" }, ""),
@@ -1738,14 +1797,6 @@ fn settings_sections(s: &Settings) -> Vec<Section> {
                 n("translation.max_batch_chars", "每批最多字符", &s.translation.max_batch_chars, ""),
                 n("translation.max_batch_segments", "每批最多段落", &s.translation.max_batch_segments, ""),
                 n("translation.max_tokens", "max_tokens", &s.translation.max_tokens, "0 表示不发送"),
-                n("translation.max_attempts", "每篇最多尝试次数", &s.translation.max_attempts, "超过后按失败策略处理"),
-                select(
-                    "translation.on_failure",
-                    "失败策略",
-                    &s.translation.on_failure,
-                    &[("publish_original", "发布原文（附说明）"), ("hold", "继续等待（最长 72 小时）")],
-                    "",
-                ),
                 check("translation.json_mode", "使用 JSON 输出格式（response_format）", s.translation.json_mode, "默认使用 <seg> 标签格式，截断时可保留已完成段落"),
                 field("translation.extra_prompt", "附加提示词", "textarea", &s.translation.extra_prompt, "如术语表、风格要求"),
                 field("translation.extra_body", "附加请求参数（JSON）", "textarea", &s.translation.extra_body, "合并到请求体，如 {\"enable_thinking\": false}"),
@@ -1875,6 +1926,8 @@ struct ToolsT {
     base: Base,
     extract_url: String,
     translate_text: String,
+    /// "" (saved setup) or an engine key.
+    translate_engine: String,
     result_err: bool,
     result_title: String,
     result_meta: String,
@@ -1886,6 +1939,7 @@ fn tools(s: &Session) -> ToolsT {
         base: base(s, "tools", &FlashQuery::default()),
         extract_url: String::new(),
         translate_text: "<p>The prime minister said on <b>Monday</b> that taxes would rise next year.</p><p>Opposition parties criticised the plan.</p>".into(),
+        translate_engine: String::new(),
         result_err: false,
         result_title: String::new(),
         result_meta: String::new(),
@@ -1956,14 +2010,25 @@ async fn tool_translate(State(app): State<AppRef>, headers: HeaderMap, body: Byt
     let mut t = tools(&s);
     t.translate_text = text.clone();
     let html = if text.contains('<') { text.clone() } else { format!("<p>{}</p>", crate::util::html::escape(&text)) };
-    let settings = app.settings.get().await;
+    let mut ts = app.settings.get().await.translation.clone();
+    // A single engine on its own, or the saved setup (main engine plus fallback).
+    if let Some(engine) = form.get("engine").and_then(Engine::parse) {
+        ts.engine = engine.key().into();
+        ts.fallback = "none".into();
+    }
+    t.translate_engine = form.get("engine").unwrap_or("").to_string();
     let started = std::time::Instant::now();
-    match app.translator.test(&settings.translation, &target, &sanitize::sanitize(&html, None)).await {
+    match app.translator.test(&ts, &target, &sanitize::sanitize(&html, None)).await {
         Ok(r) => {
             t.result_err = !r.complete;
             t.result_title = if r.complete { "翻译成功".into() } else { "翻译不完整".into() };
+            let engines = match (r.engine, r.fallback_engine) {
+                (Some(e), Some(f)) if e != f => format!("{}，{} 段由{}补译", e.label(), r.fallback_segments, f.label()),
+                (Some(e), _) => e.label().to_string(),
+                _ => String::new(),
+            };
             t.result_meta = format!(
-                "耗时 {} ms，请求 {} 次，段落 {}，缓存命中 {}，失败 {}，降级 {}\n标题：{}{}",
+                "{engines}\n耗时 {} ms，请求 {} 次，段落 {}，缓存命中 {}，失败 {}，降级 {}\n标题：{}{}",
                 started.elapsed().as_millis(),
                 r.requests,
                 r.total_segments,

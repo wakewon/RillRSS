@@ -161,7 +161,12 @@ fn stage_concurrency(s: &Settings, stage: &str) -> usize {
     match stage {
         "extract" => s.fetch.page_concurrency.clamp(1, 32) as usize,
         "transform" => 4,
-        "translate" => (s.translation.max_concurrency.clamp(1, 16) * 2) as usize,
+        // Articles in flight: enough to keep the main engine's request slots busy.
+        "translate" => {
+            let t = &s.translation;
+            let slots = if t.engine == "llm" { t.max_concurrency } else { t.mt_max_concurrency };
+            (slots.clamp(1, 32) * 2) as usize
+        }
         "images" => s.images.concurrency.clamp(1, 16) as usize,
         _ => 1,
     }
@@ -204,8 +209,8 @@ pub async fn run_dispatcher(app: AppRef) {
             if avail == 0 {
                 continue;
             }
-            // Don't claim translation work while the provider is known to be down.
-            if stage == "translate" && app.translator.circuit_open_for().is_some() {
+            // Don't claim translation work while every engine is known to be down.
+            if stage == "translate" && app.translator.paused_for(&settings.translation).is_some() {
                 continue;
             }
             let ids = match claim(&app, stage, avail).await {
@@ -735,11 +740,19 @@ async fn stage_translate(app: &AppRef, settings: &Settings, feed: &FeedRow, rev:
     // text elsewhere) is final and is published now, also under "hold". A reprocess
     // still keeps the current version rather than replace it with one translated nowhere.
     let settled = |t: &ArticleTranslation| t.failed_segments == t.filtered_segments && !(reprocess && t.filtered_segments >= t.total_segments);
-    match app.translator.translate_article(ts, &opts.target_lang, title_in, &html, bilingual).await {
+    // The fallback engine takes over an article the main engine keeps failing on, at
+    // the last attempt (before the failure policy applies).
+    match app.translator.translate_article_with(ts, &opts.target_lang, title_in, &html, bilingual, last_attempt).await {
         Ok(t) if t.complete || settled(&t) || (last_attempt && !hold && !reprocess) => {
             let mut notes = Vec::new();
             if t.skipped_same_language {
                 notes.push("跳过翻译：已是目标语言".to_string());
+            }
+            if let (Some(why), Some(engine)) = (&t.fallback_reason, t.engine) {
+                notes.push(format!("主翻译引擎失败，已改用{}：{why}", engine.label()));
+                app.event(Level::Warn, "translate", ev, format!("已改用{}翻译（主引擎失败）", engine.label())).await;
+            } else if let Some(fb) = t.fallback_engine {
+                notes.push(format!("{} / {} 段由{}补译", t.fallback_segments, t.total_segments, fb.label()));
             }
             if t.filtered_segments > 0 {
                 notes.push(format!("{} / {} 段被翻译服务的内容审核拒绝，保留原文", t.filtered_segments, t.total_segments));

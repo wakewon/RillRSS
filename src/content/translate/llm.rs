@@ -342,6 +342,11 @@ fn parse_retry_after(v: Option<&reqwest::header::HeaderValue>) -> Option<Duratio
     Some(Duration::from_secs(delta.clamp(0, MAX_RETRY_AFTER.as_secs() as i64) as u64))
 }
 
+/// Retry-After (or retry-after-ms) of a response.
+pub fn retry_after(h: &reqwest::header::HeaderMap) -> Option<Duration> {
+    parse_retry_after_ms(h.get("retry-after-ms")).or_else(|| parse_retry_after(h.get(reqwest::header::RETRY_AFTER)))
+}
+
 fn parse_retry_after_ms(v: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
     let ms = v?.to_str().ok()?.trim().parse::<u64>().ok()?;
     Some(Duration::from_millis(ms).min(MAX_RETRY_AFTER))

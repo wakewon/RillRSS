@@ -90,6 +90,7 @@
 
 ## 5. 翻译引擎（`content/translate/`）
 
+0. **引擎与回退**：`Engine::{Llm, Google, Microsoft}`，各有独立的限流器、熔断器与统计。Google（`mt.rs`）使用 Chrome 网页翻译的 `translate-pa.googleapis.com/v1/translateHtml`（内置公开 Key，批量、HTML 模式），被直接拒绝（400/401/403/404 或格式不符）时改用同一服务的 `translate_a/t?client=gtx&format=html`；占位符以 `<span id="gN">`、`<img id="xN">` 发送（Google 会把自定义标签当噪声，导致断句错误），返回后按栈映射回 `<gN>`。微软使用 Edge 的 `edge.microsoft.com/translate/translatetext`（无需令牌；旧的 `translate/auth` 令牌接口已于 2026-07 停用），该接口没有 HTML 模式、会弄坏带属性的标签，因此直接发送 `<gN>`/`<xN/>`。机器翻译的结果按顺序对应，走与 LLM 相同的校验与拆批；同一段重发结果相同，所以单段不重试。主引擎失败或被拒的段落交给回退引擎；主引擎整体出错时，最后一次尝试、主引擎熔断或未配置时整篇交给回退引擎（`translate_article_with(.., fallback_on_error)`），否则返回错误由流水线重试。所有引擎都熔断时翻译阶段才停止认领任务。缓存命名空间：LLM 为模型 + 附加提示词 + 附加参数，机器翻译为 `mt:google` / `mt:microsoft`。
 1. **切分**（`segment.rs`）：在 DOM 上找"只含行内内容"的块（p、li、h*、figcaption、td…）以及混合内容中的行内片段；行内元素变成占位符：成对标签 `<gN>…</gN>`（链接、加粗等，保留其文本供翻译）、原子占位符 `<xN/>`（图片、换行、行内代码，原样保留）。`pre`、`code`、`script` 等不翻译；纯数字/URL 段落跳过。
 2. **缓存**：键 = blake3(命名空间, 目标语言, 提示词版本, 段落源文本)，命名空间 = 模型 + 附加提示词 + 附加请求参数的哈希（两者为空时与旧键相同）；只缓存通过校验的结果，批次中途出错时已通过校验的段落照样缓存。
 3. **批量请求**：按字符数与段数分批（默认 4000 字符 / 16 段），系统提示词固定（利于提供商的提示缓存），默认 `<seg id="N">` 格式；可选 JSON 格式（`response_format`）。

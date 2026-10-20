@@ -38,21 +38,27 @@
   </div>
 
   <div class="card">
-    <div class="card-head"><h3>AI 翻译</h3>{% if s.tr_configured %}<span class="status {{ s.tr_state }}"><span class="dot {{ s.tr_state }}"></span>{{ s.tr_state_label }}</span>{% endif %}</div>
+    <div class="card-head"><h3>翻译</h3>{% if s.tr_configured %}<span class="hint">进行中 {{ s.tr_in_flight }}</span>{% endif %}</div>
     {% if s.tr_configured %}
-    <dl class="kv">
-      <dt>模型</dt><dd><code>{{ s.tr_model }}</code></dd>
-      <dt>请求</dt><dd class="num">{{ s.tr_requests }} 次{% if s.tr_failures > 0 %} · <span class="err">失败 {{ s.tr_failures }}</span>{% endif %} · 进行中 {{ s.tr_in_flight }}</dd>
-      <dt>缓存命中</dt><dd class="num">{{ s.tr_cache_hits }} 段</dd>
-      <dt>Token</dt><dd class="num">{{ s.tr_tokens }}</dd>
-    </dl>
-    {% if let Some(e) = s.tr_last_error %}<div class="callout err"><b>最近错误</b>{{ e }}{% if let Some(h) = s.tr_hint %}<div class="callout-hint">{{ h }}修改设置并保存后会立即恢复。</div>{% endif %}</div>{% endif %}
+    {% for e in s.tr_engines %}
+    <div class="engine">
+      <div class="engine-head"><b>{{ e.name }}</b> <span class="muted small">{{ e.role }}</span><span class="status {{ e.state }}"><span class="dot {{ e.state }}"></span>{{ e.state_label }}</span></div>
+      {% if e.configured %}
+      <dl class="kv">
+        {% if !e.model.is_empty() %}<dt>模型</dt><dd><code>{{ e.model }}</code></dd>{% endif %}
+        <dt>请求</dt><dd class="num">{{ e.requests }} 次{% if e.failures > 0 %} · <span class="err">失败 {{ e.failures }}</span>{% endif %} · 缓存命中 {{ e.cache_hits }} 段</dd>
+        {% if !e.model.is_empty() %}<dt>Token</dt><dd class="num">{{ e.tokens }}</dd>{% endif %}
+      </dl>
+      {% if let Some(err) = e.last_error %}<div class="callout err"><b>最近错误</b>{{ err }}{% if let Some(h) = e.hint %}<div class="callout-hint">{{ h }}修改设置并保存后会立即恢复。</div>{% endif %}</div>{% endif %}
+      {% endif %}
+    </div>
+    {% endfor %}
     <div class="form-actions">
-      {% if s.tr_state == "err" %}<form method="post" action="/admin/tasks/retry" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="btn sm"><svg class="icon sm"><use href="#i-refresh"/></svg>立即重试</button></form>{% endif %}
+      {% if s.tr_failing %}<form method="post" action="/admin/tasks/retry" class="inline"><input type="hidden" name="csrf" value="{{ base.csrf }}"><button class="btn sm"><svg class="icon sm"><use href="#i-refresh"/></svg>立即重试</button></form>{% endif %}
       <a class="btn sm ghost" href="/admin/settings#translation">翻译设置</a>
     </div>
     {% else %}
-    <div class="empty compact"><svg class="icon"><use href="#i-globe"/></svg><div>尚未配置翻译接口</div><a class="btn sm" href="/admin/settings#translation" style="margin-top:12px">去设置</a></div>
+    <div class="empty compact"><svg class="icon"><use href="#i-globe"/></svg><div>尚未配置翻译</div><a class="btn sm" href="/admin/settings#translation" style="margin-top:12px">去设置</a></div>
     {% endif %}
   </div>
 </div>

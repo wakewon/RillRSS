@@ -125,6 +125,15 @@ impl Default for FulltextSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TranslationSettings {
+    /// Translation engine: "llm" (the OpenAI-compatible API below), "google" or
+    /// "microsoft" (free machine translation, no key).
+    pub engine: String,
+    /// Engine for what the main engine could not translate: "none" or one of the engines.
+    pub fallback: String,
+    /// Concurrent requests to each machine-translation engine.
+    pub mt_max_concurrency: u32,
+    /// Requests per minute to each machine-translation engine (0 = unlimited).
+    pub mt_requests_per_minute: u32,
     /// OpenAI-compatible base URL, e.g. https://api.openai.com/v1
     pub base_url: String,
     pub api_key: String,
@@ -157,6 +166,10 @@ pub struct TranslationSettings {
 impl Default for TranslationSettings {
     fn default() -> Self {
         TranslationSettings {
+            engine: "llm".into(),
+            fallback: "none".into(),
+            mt_max_concurrency: 4,
+            mt_requests_per_minute: 120,
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
@@ -176,9 +189,23 @@ impl Default for TranslationSettings {
     }
 }
 
+/// Translation engines (`TranslationSettings::engine`).
+pub const ENGINES: &[&str] = &["llm", "google", "microsoft"];
+
 impl TranslationSettings {
+    /// The OpenAI-compatible API is set up.
     pub fn is_configured(&self) -> bool {
         !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
+
+    /// Some engine can translate: a machine-translation engine, or the configured API.
+    pub fn is_usable(&self) -> bool {
+        self.engine != "llm" || self.fallback != "none" || self.is_configured()
+    }
+
+    /// The fallback engine, if any.
+    pub fn fallback_engine(&self) -> Option<&str> {
+        Some(self.fallback.as_str()).filter(|f| *f != "none" && *f != self.engine)
     }
 }
 
@@ -310,6 +337,14 @@ impl Settings {
         if t.on_failure != "hold" && t.on_failure != "publish_original" {
             t.on_failure = TranslationSettings::default().on_failure;
         }
+        if !ENGINES.contains(&t.engine.as_str()) {
+            t.engine = TranslationSettings::default().engine;
+        }
+        if t.fallback != "none" && !ENGINES.contains(&t.fallback.as_str()) || t.fallback == t.engine {
+            t.fallback = "none".into();
+        }
+        t.mt_max_concurrency = t.mt_max_concurrency.clamp(1, 32);
+        t.mt_requests_per_minute = t.mt_requests_per_minute.min(1_000_000);
 
         let i = &mut self.images;
         i.max_mb = i.max_mb.clamp(1, 200);
@@ -551,6 +586,8 @@ mod tests {
         s.updates.min_change_ratio = -3.0;
         s.updates.page_check_minutes = vec![240, 30, 30, u32::MAX];
         s.translation.on_failure = "whatever".into();
+        s.translation.engine = "babelfish".into();
+        s.translation.fallback = "llm".into(); // same as the (reset) engine
         s.translation.max_attempts = 0;
         s.fetch.timeout_secs = 0;
         s.clamp();
@@ -561,6 +598,7 @@ mod tests {
         assert_eq!(s.updates.min_change_ratio, 0.0);
         assert_eq!(s.updates.page_check_minutes, vec![30, 30, 240, 60 * 24 * MAX_DAYS]);
         assert_eq!(s.translation.on_failure, "publish_original");
+        assert_eq!((s.translation.engine.as_str(), s.translation.fallback.as_str()), ("llm", "none"));
         assert_eq!(s.translation.max_attempts, 1);
         assert_eq!(s.fetch.timeout_secs, 5);
         assert_eq!(FeedOptions::from_json("{\"retention_days\":4000000000}").retention_days, Some(MAX_DAYS));

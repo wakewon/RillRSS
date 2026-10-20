@@ -422,3 +422,268 @@ fn chat_response(content: &str) -> (u16, String) {
     });
     (200, resp.to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Machine-translation engines and the fallback engine
+// ---------------------------------------------------------------------------
+
+use rillrss::content::translate::Engine;
+use rillrss::content::translate::llm::ApiError;
+use rillrss::content::translate::mt::{self, MtBackend};
+
+/// A machine-translation engine translating every text with `pseudo_translate` (tags
+/// kept), or failing every request with `fail`.
+struct FakeMt {
+    calls: AtomicUsize,
+    segments: AtomicUsize,
+    fail: Option<u16>,
+}
+
+impl FakeMt {
+    fn new(fail: Option<u16>) -> Arc<FakeMt> {
+        Arc::new(FakeMt { calls: AtomicUsize::new(0), segments: AtomicUsize::new(0), fail })
+    }
+}
+
+impl MtBackend for FakeMt {
+    fn translate(&self, texts: Vec<String>, _target: String) -> futures::future::BoxFuture<'_, Result<Vec<String>, ApiError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(status) = self.fail {
+                return Err(ApiError::Http { status, body: "down".into(), retry_after: None });
+            }
+            self.segments.fetch_add(texts.len(), Ordering::SeqCst);
+            Ok(texts.iter().map(|t| pseudo_translate(t)).collect())
+        })
+    }
+}
+
+#[tokio::test]
+async fn machine_translation_engine_translates_articles() {
+    let mock = start_mock().await;
+    let t = start_app(|s| s.translation.engine = "google".into()).await;
+    let google = FakeMt::new(None);
+    t.app.translator.set_mt_backend(Engine::Google, google.clone());
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    let (title, content): (String, String) = t.query("SELECT title, content FROM items", |r| Ok((r.get(0)?, r.get(1)?))).await;
+    assert!(!content.contains("prime minister") && content.contains("href=\"https://x.example.com/pm\""), "{content}");
+    assert!(!title.contains("Taxes"), "{title}");
+    // One request for the whole article (title included), no LLM involved.
+    assert_eq!(google.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.llm_calls(), 0);
+    assert_eq!(t.app.translator.engine_stats(Engine::Google).requests, 1);
+}
+
+#[tokio::test]
+async fn fallback_engine_fills_in_moderated_segments() {
+    // Zhipu refuses one paragraph; Google translates it, so the article is complete.
+    let mock = start_mock().await;
+    let glm = json!({"contentFilter": [{"level": 1, "role": "assistant"}], "error": {"code": "1301", "message": "系统检测到输入或生成内容可能包含不安全或敏感内容"}}).to_string();
+    let (url, _calls) = llm_mock(move |user| if user.contains("Opposition parties") { (400, glm.clone()) } else { completion(user) }).await;
+    let t = start_app(|s| {
+        llm_settings(&url)(s);
+        s.translation.fallback = "google".into();
+    })
+    .await;
+    let google = FakeMt::new(None);
+    t.app.translator.set_mt_backend(Engine::Google, google.clone());
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(!content.contains("Opposition parties") && !content.contains("prime minister"), "{content}");
+    assert_eq!(google.segments.load(Ordering::SeqCst), 1, "only the refused paragraph");
+    let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
+    assert!(notes.contains("由Google 翻译补译") && !notes.contains("内容审核"), "{notes}");
+}
+
+#[tokio::test]
+async fn fallback_engine_takes_the_article_when_the_main_engine_fails() {
+    // The LLM is down. Earlier attempts retry it; the last one goes to Microsoft.
+    let mock = start_mock().await;
+    let t = start_app(|s| {
+        tr_settings(&mock)(s);
+        s.translation.fallback = "microsoft".into();
+        s.translation.max_attempts = 2;
+    })
+    .await;
+    mock.script_llm(vec![LlmMode::Http(400); 1000]);
+    let microsoft = FakeMt::new(None);
+    t.app.translator.set_mt_backend(Engine::Microsoft, microsoft.clone());
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    for _ in 0..100 {
+        if t.count("SELECT COUNT(*) FROM items").await > 0 {
+            break;
+        }
+        t.app.db.call(|c| Ok(c.execute("UPDATE revisions SET next_attempt_at = 0 WHERE state = 'pending'", [])?)).await.unwrap();
+        t.app.wake_pipeline.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(!content.contains("prime minister"), "{content}");
+    let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
+    assert!(notes.contains("已改用微软翻译"), "{notes}");
+    assert!(microsoft.calls.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn paused_main_engine_hands_new_articles_to_the_fallback() {
+    // A bad API key pauses the LLM at once; articles keep flowing through Google.
+    let mock = start_mock().await;
+    let t = start_app(|s| {
+        tr_settings(&mock)(s);
+        s.translation.fallback = "google".into();
+        s.translation.on_failure = "hold".into();
+    })
+    .await;
+    mock.script_llm(vec![LlmMode::Http(401); 1000]);
+    let google = FakeMt::new(None);
+    t.app.translator.set_mt_backend(Engine::Google, google.clone());
+    let entries: Vec<Entry> = (0..3).map(|i| entry(&format!("p{i}"), &format!("Story {i}"), &format!("https://news.example.com/p{i}"), ARTICLE)).collect();
+    mock.set("/en.xml", "application/rss+xml", rss("English", &entries));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    for _ in 0..100 {
+        if t.count("SELECT COUNT(*) FROM items").await == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 3);
+    assert!(t.app.translator.circuit_open_for().is_some(), "the LLM is paused");
+    assert!(mock.llm_calls() <= 3, "{} LLM calls", mock.llm_calls());
+    assert_eq!(t.count("SELECT COUNT(*) FROM items WHERE content LIKE '%prime minister%'").await, 0);
+}
+
+#[tokio::test]
+async fn failing_fallback_leaves_the_main_engine_result() {
+    // Both engines fail: the failure policy applies as before (original after the
+    // last attempt), and the fallback's error shows in the problems.
+    let mock = start_mock().await;
+    let (url, _calls) = llm_mock(|user| if user.contains("Opposition parties") { refusal() } else { completion(user) }).await;
+    let t = start_app(|s| {
+        llm_settings(&url)(s);
+        s.translation.fallback = "google".into();
+        s.translation.max_attempts = 1;
+    })
+    .await;
+    t.app.translator.set_mt_backend(Engine::Google, FakeMt::new(Some(503)));
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(content.contains("Opposition parties") && !content.contains("prime minister"), "{content}");
+    let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
+    assert!(notes.contains("翻译不完整"), "{notes}");
+}
+
+type Handler = Arc<dyn Fn(&str) -> (u16, String) + Send + Sync>;
+
+/// A server answering `path` with `f(request body) -> (status, body)`.
+async fn http_mock(routes: Vec<(&'static str, Handler)>) -> String {
+    let mut app = Router::new();
+    for (path, f) in routes {
+        app = app.route(
+            path,
+            post(move |body: Bytes| {
+                let f = f.clone();
+                async move {
+                    let (status, body) = f(&String::from_utf8_lossy(&body));
+                    (StatusCode::from_u16(status).unwrap(), [(header::CONTENT_TYPE, "text/plain")], body)
+                }
+            }),
+        );
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn google_protocol_and_markup() {
+    // translateHtml: [[texts, "auto", target], "wt_lib"] -> [[translations], [langs]].
+    let base = http_mock(vec![(
+        "/html",
+        Arc::new(|body: &str| {
+            let v: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v[0][2], "zh-CN");
+            let texts: Vec<String> = v[0][0].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+            assert!(texts[0].contains("<span id=\"g1\">Monday</span>") && texts[0].contains("<img id=\"x2\">"), "{texts:?}");
+            let out: Vec<String> = texts.iter().map(|t| pseudo_translate(t)).collect();
+            (200, json!([out, vec!["en"; texts.len()]]).to_string())
+        }),
+    )])
+    .await;
+    let g = mt::Google::with_urls(reqwest::Client::new(), &format!("{base}/html"), &format!("{base}/t"));
+    let out = g.translate(vec!["Said on <g1>Monday</g1>.<x2/>".into(), "Second one.".into()], "zh-cn".into()).await.unwrap();
+    assert!(out[0].contains("<g1>") && out[0].contains("</g1>") && out[0].contains("<x2/>") && !out[0].contains("Monday"), "{out:?}");
+    assert_eq!(out.len(), 2);
+
+    // A refused key falls back to translate_a/t (form fields q=…; [[text, lang], …]).
+    let base = http_mock(vec![
+        ("/html", Arc::new(|_: &str| (403, "{\"error\":{\"code\":403}}".to_string()))),
+        (
+            "/t",
+            Arc::new(|body: &str| {
+                let texts: Vec<String> = url::form_urlencoded::parse(body.as_bytes()).filter(|(k, _)| k == "q").map(|(_, v)| v.into_owned()).collect();
+                (200, json!(texts.iter().map(|t| json!([pseudo_translate(t), "en"])).collect::<Vec<_>>()).to_string())
+            }),
+        ),
+    ])
+    .await;
+    let g = mt::Google::with_urls(reqwest::Client::new(), &format!("{base}/html"), &format!("{base}/t"));
+    let out = g.translate(vec!["Said on <g1>Monday</g1>.".into(), "Second one.".into()], "zh-CN".into()).await.unwrap();
+    assert!(out[0].contains("<g1>") && !out[0].contains("Monday") && out.len() == 2, "{out:?}");
+
+    // Rate limits are reported (the engine backs off), not retried elsewhere.
+    let base = http_mock(vec![("/html", Arc::new(|_: &str| (429, "<html>Sorry...</html>".to_string())))]).await;
+    let g = mt::Google::with_urls(reqwest::Client::new(), &format!("{base}/html"), &format!("{base}/t"));
+    let err = g.translate(vec!["x".into()], "zh-CN".into()).await.unwrap_err();
+    assert!(matches!(err, ApiError::Http { status: 429, .. }) && err.is_transient(), "{err}");
+}
+
+#[tokio::test]
+async fn microsoft_protocol() {
+    // A bare JSON array of strings -> [{"translations": [{"text": …}]}, …].
+    let base = http_mock(vec![(
+        "/mt",
+        Arc::new(|body: &str| {
+            let texts: Vec<String> = serde_json::from_str(body).unwrap();
+            assert!(texts[0].contains("<g1>Monday</g1>"), "placeholders sent as they are: {texts:?}");
+            let out: Vec<Value> = texts.iter().map(|t| json!({"translations": [{"text": pseudo_translate(t), "to": "zh-Hans"}]})).collect();
+            (200, json!(out).to_string())
+        }),
+    )])
+    .await;
+    let m = mt::Microsoft::with_url(reqwest::Client::new(), &format!("{base}/mt"));
+    let out = m.translate(vec!["Said on <g1>Monday</g1>.".into(), "Second one.".into()], "zh-CN".into()).await.unwrap();
+    assert!(out[0].contains("<g1>") && !out[0].contains("Monday") && out.len() == 2, "{out:?}");
+}
+
+/// Against the real services (network): `cargo test --test translation live_ -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn live_machine_translation_engines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = rillrss::db::Db::open(&tmp.path().join("t.db")).unwrap();
+    let tr = rillrss::content::translate::Translator::new(db, reqwest::Client::new());
+    let html = "<p>The prime minister said on <a href=\"https://x.example.com/pm\">Monday</a> that taxes would <b>rise</b> next year.</p>\
+<p>Shares of <code>ACME</code> fell 5% after Jane Doe said a &lt; b &amp; c.<br>Second line here.</p><ul><li>First point about the budget.</li></ul>";
+    for engine in ["google", "microsoft"] {
+        let s = rillrss::settings::TranslationSettings { engine: engine.into(), ..Default::default() };
+        let r = tr.translate_article(&s, "zh-CN", Some("Taxes to rise next year"), html, false).await.unwrap();
+        println!("{engine}: complete={} failed={} degraded={} requests={}\n  title: {:?}\n  {}\n  problems: {:?}", r.complete, r.failed_segments, r.degraded_segments, r.requests, r.title, r.html, r.problems);
+        assert!(r.complete, "{engine}: {r:?}");
+        assert!(r.html.contains("href=\"https://x.example.com/pm\"") && r.html.contains("<code>ACME</code>"), "{engine}: {}", r.html);
+    }
+}

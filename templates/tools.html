@@ -28,7 +28,16 @@
     <form method="post" action="/admin/tools/translate" class="stack-sm">
       <input type="hidden" name="csrf" value="{{ base.csrf }}">
       <div class="field"><label for="tr_text">文本或 HTML</label><textarea id="tr_text" name="text" rows="5">{{ translate_text }}</textarea></div>
-      <div class="form-row"><div class="field grow"><label for="tr_target">目标语言</label><input type="text" id="tr_target" name="target" value="zh-CN"></div><div class="fixed"><button class="btn primary">翻译</button></div></div>
+      <div class="form-row">
+        <div class="field grow"><label for="tr_engine">引擎</label><select id="tr_engine" name="engine">
+          <option value=""{% if translate_engine.is_empty() %} selected{% endif %}>当前设置（主引擎 + 回退）</option>
+          <option value="llm"{% if translate_engine == "llm" %} selected{% endif %}>仅 AI 翻译</option>
+          <option value="google"{% if translate_engine == "google" %} selected{% endif %}>仅 Google 翻译</option>
+          <option value="microsoft"{% if translate_engine == "microsoft" %} selected{% endif %}>仅微软翻译</option>
+        </select></div>
+        <div class="field fixed" style="width:120px"><label for="tr_target">目标语言</label><input type="text" id="tr_target" name="target" value="zh-CN"></div>
+        <div class="fixed"><button class="btn primary">翻译</button></div>
+      </div>
     </form>
   </div>
   <div class="card">

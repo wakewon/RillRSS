@@ -1,15 +1,18 @@
-//! Article translation with an OpenAI-compatible LLM.
+//! Article translation: an OpenAI-compatible LLM, or free machine translation (Google,
+//! Microsoft), with an optional fallback engine.
 //!
 //! Pipeline per article:
 //!   segment HTML (placeholders for inline markup) -> look up the segment cache ->
-//!   batch the misses -> call the model (rate limited, retried, circuit breaker) ->
+//!   batch the misses -> call the engine (rate limited, retried, circuit breaker) ->
 //!   validate every segment -> re-translate failures in smaller batches down to single
-//!   segments -> store good segments in the cache -> rebuild the HTML.
+//!   segments -> store good segments in the cache -> hand what is still missing to the
+//!   fallback engine -> rebuild the HTML.
 //! Untranslatable leftovers keep their source text and are reported, so the caller
 //! can retry later (only the missing segments are requested again thanks to the cache).
 
 pub mod lang;
 pub mod llm;
+pub mod mt;
 pub mod segment;
 pub mod validate;
 
@@ -25,6 +28,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 
 use self::llm::{ApiError, ChatBackend, ChatRequest, OpenAiCompat};
+use self::mt::MtBackend;
 use self::segment::{Segment, segment_html};
 use self::validate::Problem;
 use crate::db::Db;
@@ -46,6 +50,45 @@ pub enum TranslateError {
     Other(String),
 }
 
+/// A translation engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum Engine {
+    /// The OpenAI-compatible API.
+    Llm,
+    Google,
+    Microsoft,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 3] = [Engine::Llm, Engine::Google, Engine::Microsoft];
+
+    /// From the settings value ("llm", "google", "microsoft").
+    pub fn parse(s: &str) -> Option<Engine> {
+        match s.trim() {
+            "llm" => Some(Engine::Llm),
+            "google" => Some(Engine::Google),
+            "microsoft" => Some(Engine::Microsoft),
+            _ => None,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Engine::Llm => "llm",
+            Engine::Google => "google",
+            Engine::Microsoft => "microsoft",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Engine::Llm => "AI 翻译",
+            Engine::Google => "Google 翻译",
+            Engine::Microsoft => "微软翻译",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ArticleTranslation {
     pub title: Option<String>,
@@ -58,6 +101,13 @@ pub struct ArticleTranslation {
     /// Failed segments refused by the provider's content moderation (part of
     /// `failed_segments`). Retrying will not change them.
     pub filtered_segments: usize,
+    /// Segments the fallback engine translated.
+    pub fallback_segments: usize,
+    /// The engine that did (most of) the work, and the fallback engine when it helped.
+    pub engine: Option<Engine>,
+    pub fallback_engine: Option<Engine>,
+    /// Why the whole article went to the fallback engine (the main engine's error).
+    pub fallback_reason: Option<String>,
     pub degraded_segments: usize,
     pub cache_hits: usize,
     pub requests: usize,
@@ -296,26 +346,90 @@ pub struct TranslatorStats {
 // Translator
 // ---------------------------------------------------------------------------
 
-pub struct Translator {
-    db: Db,
-    client: reqwest::Client,
+/// Rate limiting, circuit breaker and statistics of one engine.
+struct EngineState {
     limiter: Limiter,
     breaker: Mutex<Breaker>,
     rejections: Mutex<Rejections>,
     stats: Mutex<TranslatorStats>,
+}
+
+impl EngineState {
+    fn new() -> EngineState {
+        EngineState {
+            limiter: Limiter::new(),
+            breaker: Mutex::new(Breaker::default()),
+            rejections: Mutex::new(Rejections::default()),
+            stats: Mutex::new(TranslatorStats::default()),
+        }
+    }
+
+    fn open_for(&self) -> Option<Duration> {
+        let b = self.breaker.lock().unwrap();
+        let now = Instant::now();
+        match b.open_until {
+            Some(t) if t > now => Some(t - now),
+            Some(_) if b.probe.is_some_and(|deadline| deadline > now) => Some(Duration::ZERO),
+            _ => None,
+        }
+    }
+
+    fn reset(&self) {
+        self.breaker.lock().unwrap().reset();
+        *self.rejections.lock().unwrap() = Rejections::default();
+    }
+}
+
+pub struct Translator {
+    db: Db,
+    client: reqwest::Client,
+    llm: EngineState,
+    google: EngineState,
+    microsoft: EngineState,
     /// Backend override (tests).
     backend: Mutex<Option<Arc<dyn ChatBackend>>>,
+    /// Machine-translation backends (replaceable in tests).
+    mt: Mutex<HashMap<Engine, Arc<dyn MtBackend>>>,
     /// Base delay for transport retries (milliseconds; lowered in tests).
     pub retry_base_ms: std::sync::atomic::AtomicU64,
 }
 
+enum Backend {
+    Chat(Arc<dyn ChatBackend>),
+    Mt(Arc<dyn MtBackend>),
+}
+
 struct Ctx<'a> {
-    backend: &'a dyn ChatBackend,
+    engine: Engine,
+    state: &'a EngineState,
+    backend: Backend,
     settings: &'a TranslationSettings,
     target: &'a str,
     system: String,
     requests: Mutex<usize>,
     max_requests: usize,
+}
+
+impl Ctx<'_> {
+    fn limits(&self) -> (u32, u32) {
+        match self.engine {
+            Engine::Llm => (self.settings.max_concurrency, self.settings.requests_per_minute),
+            _ => (self.settings.mt_max_concurrency, self.settings.mt_requests_per_minute),
+        }
+    }
+}
+
+/// Segments translated by one engine.
+#[derive(Default)]
+struct EngineRun {
+    translations: HashMap<usize, String>,
+    /// Settled without a translation: kept in the source language on purpose.
+    kept: HashSet<usize>,
+    failed: Vec<(usize, Problem)>,
+    degraded: usize,
+    cache_hits: usize,
+    requests: usize,
+    error: Option<TranslateError>,
 }
 
 /// One parsed model answer.
@@ -332,51 +446,87 @@ const SMALL_REQUEST_CHARS: usize = 1000;
 
 impl Translator {
     pub fn new(db: Db, client: reqwest::Client) -> Translator {
+        let mt: HashMap<Engine, Arc<dyn MtBackend>> = HashMap::from([
+            (Engine::Google, Arc::new(mt::Google::new(client.clone())) as Arc<dyn MtBackend>),
+            (Engine::Microsoft, Arc::new(mt::Microsoft::new(client.clone())) as Arc<dyn MtBackend>),
+        ]);
         Translator {
             db,
             client,
-            limiter: Limiter::new(),
-            breaker: Mutex::new(Breaker::default()),
-            rejections: Mutex::new(Rejections::default()),
-            stats: Mutex::new(TranslatorStats::default()),
+            llm: EngineState::new(),
+            google: EngineState::new(),
+            microsoft: EngineState::new(),
             backend: Mutex::new(None),
+            mt: Mutex::new(mt),
             retry_base_ms: std::sync::atomic::AtomicU64::new(1000),
         }
     }
 
-    /// Replace the backend (used by tests).
+    fn state(&self, engine: Engine) -> &EngineState {
+        match engine {
+            Engine::Llm => &self.llm,
+            Engine::Google => &self.google,
+            Engine::Microsoft => &self.microsoft,
+        }
+    }
+
+    /// Replace the LLM backend (used by tests).
     pub fn set_backend(&self, b: Option<Arc<dyn ChatBackend>>) {
         *self.backend.lock().unwrap() = b;
     }
 
+    /// Replace a machine-translation backend (used by tests).
+    pub fn set_mt_backend(&self, engine: Engine, b: Arc<dyn MtBackend>) {
+        self.mt.lock().unwrap().insert(engine, b);
+    }
+
+    /// Statistics of the LLM engine.
     pub fn stats(&self) -> TranslatorStats {
-        self.stats.lock().unwrap().clone()
+        self.engine_stats(Engine::Llm)
     }
 
+    pub fn engine_stats(&self, engine: Engine) -> TranslatorStats {
+        self.state(engine).stats.lock().unwrap().clone()
+    }
+
+    /// Requests in flight, all engines together.
     pub fn in_flight(&self) -> u32 {
-        self.limiter.in_flight()
+        Engine::ALL.iter().map(|e| self.state(*e).limiter.in_flight()).sum()
     }
 
-    /// Remaining time the circuit breaker stays open, if open (zero while the half-open
-    /// probe is in flight).
+    /// Remaining time the LLM circuit breaker stays open, if open (zero while the
+    /// half-open probe is in flight).
     pub fn circuit_open_for(&self) -> Option<Duration> {
-        let b = self.breaker.lock().unwrap();
-        let now = Instant::now();
-        match b.open_until {
-            Some(t) if t > now => Some(t - now),
-            Some(_) if b.probe.is_some_and(|deadline| deadline > now) => Some(Duration::ZERO),
-            _ => None,
+        self.engine_open_for(Engine::Llm)
+    }
+
+    pub fn engine_open_for(&self, engine: Engine) -> Option<Duration> {
+        self.state(engine).open_for()
+    }
+
+    /// How long until some configured engine can take requests again (None: one can now).
+    pub fn paused_for(&self, s: &TranslationSettings) -> Option<Duration> {
+        let main = Engine::parse(&s.engine).unwrap_or(Engine::Llm);
+        let main_wait = self.engine_open_for(main)?;
+        match s.fallback_engine().and_then(Engine::parse) {
+            Some(f) => self.engine_open_for(f).map(|w| w.min(main_wait)),
+            None => Some(main_wait),
         }
     }
 
     pub fn reset_circuit(&self) {
-        self.breaker.lock().unwrap().reset();
-        *self.rejections.lock().unwrap() = Rejections::default();
+        for e in Engine::ALL {
+            self.state(e).reset();
+        }
     }
 
-    fn make_backend(&self, s: &TranslationSettings) -> Result<Arc<dyn ChatBackend>, TranslateError> {
+    fn make_backend(&self, engine: Engine, s: &TranslationSettings) -> Result<Backend, TranslateError> {
+        if engine != Engine::Llm {
+            let b = self.mt.lock().unwrap().get(&engine).cloned();
+            return b.map(Backend::Mt).ok_or(TranslateError::NotConfigured);
+        }
         if let Some(b) = self.backend.lock().unwrap().clone() {
-            return Ok(b);
+            return Ok(Backend::Chat(b));
         }
         if !s.is_configured() {
             return Err(TranslateError::NotConfigured);
@@ -389,14 +539,14 @@ impl Translator {
                     .map_err(|e| TranslateError::Other(format!("附加请求参数不是有效的 JSON：{e}")))?,
             )
         };
-        Ok(Arc::new(OpenAiCompat {
+        Ok(Backend::Chat(Arc::new(OpenAiCompat {
             client: self.client.clone(),
             endpoint: llm::endpoint_for(&s.base_url),
             api_key: s.api_key.trim().to_string(),
             model: s.model.trim().to_string(),
             timeout: Duration::from_secs(s.timeout_secs.max(10) as u64),
             extra_body,
-        }))
+        })))
     }
 
     fn system_prompt(target: &str, extra: &str, json: bool) -> String {
@@ -515,7 +665,9 @@ impl Translator {
             .await
     }
 
-    /// Translate an article (title + HTML fragment).
+    /// Translate an article (title + HTML fragment). Segments the main engine cannot
+    /// translate go to the fallback engine; when the main engine fails altogether, the
+    /// whole article does if `fallback_on_error` (or the engine is paused / not set up).
     pub async fn translate_article(
         &self,
         settings: &TranslationSettings,
@@ -524,9 +676,20 @@ impl Translator {
         html: &str,
         bilingual: bool,
     ) -> Result<ArticleTranslation, TranslateError> {
-        let backend = self.make_backend(settings)?;
-        let model = backend.model_id();
-        let cache_ns = Self::cache_namespace(&model, settings);
+        self.translate_article_with(settings, target, title, html, bilingual, false).await
+    }
+
+    pub async fn translate_article_with(
+        &self,
+        settings: &TranslationSettings,
+        target: &str,
+        title: Option<&str>,
+        html: &str,
+        bilingual: bool,
+        fallback_on_error: bool,
+    ) -> Result<ArticleTranslation, TranslateError> {
+        let main = Engine::parse(&settings.engine).unwrap_or(Engine::Llm);
+        let fallback = settings.fallback_engine().and_then(Engine::parse).filter(|f| *f != main);
         // The parsed document is not Send; keep only the segments across awaits and
         // re-segment (deterministically) when applying the translations.
         let mut segments: Vec<Segment> = segment_html(html).segments;
@@ -540,7 +703,7 @@ impl Translator {
                 placeholders: HashMap::new(),
             });
         }
-        let mut result = ArticleTranslation { total_segments: segments.len(), ..Default::default() };
+        let mut result = ArticleTranslation { total_segments: segments.len(), engine: Some(main), ..Default::default() };
 
         // Skip articles already written in the target language.
         let all_text: String = segments.iter().map(|s| s.plain()).collect::<Vec<_>>().join("\n");
@@ -552,85 +715,68 @@ impl Translator {
             return Ok(result);
         }
 
-        // Cache lookup.
-        let keys: Vec<String> = segments.iter().map(|s| Self::cache_key(&cache_ns, target, &s.text)).collect();
-        let cached = self.cache_get(keys.clone()).await.map_err(|e| TranslateError::Other(e.to_string()))?;
-        let mut translations: HashMap<usize, String> = HashMap::new();
-        let mut misses: Vec<Segment> = Vec::new();
-        for (s, k) in segments.iter().zip(keys.iter()) {
-            match cached.get(k) {
-                Some(v) => {
-                    translations.insert(s.id, v.clone());
-                    result.cache_hits += 1;
-                }
-                None => misses.push(s.clone()),
-            }
-        }
-        self.stats.lock().unwrap().cache_hits += result.cache_hits as u64;
-
-        if !misses.is_empty() {
-            let ctx = Ctx {
-                backend: backend.as_ref(),
-                settings,
-                target,
-                system: Self::system_prompt(target, &settings.extra_prompt, settings.json_mode),
-                requests: Mutex::new(0),
-                max_requests: misses.len() * 3 + 10,
+        let mut run = self.run_engine(main, settings, target, &segments).await;
+        result.cache_hits = run.cache_hits;
+        result.requests = run.requests;
+        result.degraded_segments = run.degraded;
+        if let Some(fb) = fallback {
+            // The main engine failed altogether: when it will not recover soon (paused,
+            // not set up) or this was the last attempt, the fallback takes the article.
+            let take_all = run.error.as_ref().is_some_and(|e| {
+                fallback_on_error || matches!(e, TranslateError::CircuitOpen(_) | TranslateError::NotConfigured)
+            });
+            let pending: Vec<Segment> = if take_all {
+                segments.iter().filter(|s| !run.translations.contains_key(&s.id) && !run.kept.contains(&s.id)).cloned().collect()
+            } else if run.error.is_none() {
+                segments.iter().filter(|s| run.failed.iter().any(|(id, _)| *id == s.id)).cloned().collect()
+            } else {
+                Vec::new()
             };
-            let batches = make_batches(&misses, settings.max_batch_chars as usize, settings.max_batch_segments as usize);
-            let conc = settings.max_concurrency.clamp(1, 8) as usize;
-            let outcomes: Vec<BatchOutcome> = futures::stream::iter(batches)
-                .map(|b| {
-                    let ctx = &ctx;
-                    async move { self.translate_batch(ctx, b, 0, false).await }
-                })
-                .buffer_unordered(conc)
-                .collect()
-                .await;
-            let mut first_err: Option<TranslateError> = None;
-            let mut to_cache = Vec::new();
-            for o in outcomes {
-                for (id, text, quality) in o.good {
-                    if quality == Quality::Source {
-                        continue; // keeps its source text
-                    }
-                    if let Some(s) = misses.iter().find(|s| s.id == id) {
-                        if quality == Quality::Good {
-                            to_cache.push((Self::cache_key(&cache_ns, target, &s.text), s.text.clone(), text.clone()));
-                        } else {
-                            result.degraded_segments += 1;
+            if !pending.is_empty() {
+                let fb_run = self.run_engine(fb, settings, target, &pending).await;
+                result.cache_hits += fb_run.cache_hits;
+                result.requests += fb_run.requests;
+                result.degraded_segments += fb_run.degraded;
+                match fb_run.error {
+                    // The fallback could not help: the main engine's outcome stands.
+                    Some(e) => result.problems.push(format!("{}：{e}", fb.label())),
+                    None => {
+                        if take_all {
+                            result.fallback_reason = run.error.take().map(|e| e.to_string());
                         }
+                        let fixed: HashSet<usize> = fb_run.translations.keys().chain(fb_run.kept.iter()).copied().collect();
+                        result.fallback_segments = fb_run.translations.len();
+                        if result.fallback_segments > 0 {
+                            result.fallback_engine = Some(fb);
+                            if take_all {
+                                result.engine = Some(fb);
+                            }
+                        }
+                        run.failed.retain(|(id, _)| !fixed.contains(id));
+                        // Segments the main engine never got to (it failed) fail with
+                        // the fallback's verdict.
+                        for (id, p) in fb_run.failed {
+                            if !run.failed.iter().any(|(i, _)| *i == id) {
+                                run.failed.push((id, p));
+                            }
+                        }
+                        run.translations.extend(fb_run.translations);
+                        run.kept.extend(fb_run.kept);
                     }
-                    translations.insert(id, text);
                 }
-                for (id, p) in o.failed {
-                    result.failed_segments += 1;
-                    if p == Problem::Filtered {
-                        result.filtered_segments += 1;
-                    }
-                    result.problems.push(format!("segment {id}: {}", p.as_str()));
-                }
-                // Batches that ended in an error still deliver what was validated before.
-                if let Some(e) = o.error
-                    && first_err.is_none()
-                {
-                    first_err = Some(e);
-                }
-            }
-            result.requests = *ctx.requests.lock().unwrap();
-            {
-                let mut st = self.stats.lock().unwrap();
-                st.segments_translated += to_cache.len() as u64;
-            }
-            // Keep what we got even if a batch failed: the next attempt hits the cache.
-            self.cache_put(model.clone(), lang::norm(target), to_cache)
-                .await
-                .map_err(|e| TranslateError::Other(e.to_string()))?;
-            if let Some(e) = first_err {
-                return Err(e);
             }
         }
-
+        if let Some(e) = run.error {
+            return Err(e);
+        }
+        for (id, p) in &run.failed {
+            result.failed_segments += 1;
+            if *p == Problem::Filtered {
+                result.filtered_segments += 1;
+            }
+            result.problems.push(format!("segment {id}: {}", p.as_str()));
+        }
+        let mut translations = run.translations;
         result.title = title.map(|t| translations
                     .get(&title_id)
                     .map(|tr| html_escape::decode_html_entities(&segment::strip_placeholders(tr)).trim().to_string())
@@ -643,6 +789,105 @@ impl Translator {
         result.complete = result.failed_segments == 0;
         result.html = segment_html(html).apply(&translations, bilingual, target);
         Ok(result)
+    }
+
+    /// Translate segments with one engine: cache first, then batches of the misses.
+    async fn run_engine(&self, engine: Engine, settings: &TranslationSettings, target: &str, segments: &[Segment]) -> EngineRun {
+        let mut run = EngineRun::default();
+        let backend = match self.make_backend(engine, settings) {
+            Ok(b) => b,
+            Err(e) => {
+                run.error = Some(e);
+                return run;
+            }
+        };
+        let (model, cache_ns) = match &backend {
+            Backend::Chat(b) => (b.model_id(), Self::cache_namespace(&b.model_id(), settings)),
+            Backend::Mt(_) => (format!("mt:{}", engine.key()), format!("mt:{}", engine.key())),
+        };
+        let state = self.state(engine);
+
+        // Cache lookup.
+        let keys: Vec<String> = segments.iter().map(|s| Self::cache_key(&cache_ns, target, &s.text)).collect();
+        let cached = match self.cache_get(keys.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                run.error = Some(TranslateError::Other(e.to_string()));
+                return run;
+            }
+        };
+        let mut misses: Vec<Segment> = Vec::new();
+        for (s, k) in segments.iter().zip(keys.iter()) {
+            match cached.get(k) {
+                Some(v) => {
+                    run.translations.insert(s.id, v.clone());
+                    run.cache_hits += 1;
+                }
+                None => misses.push(s.clone()),
+            }
+        }
+        state.stats.lock().unwrap().cache_hits += run.cache_hits as u64;
+        if misses.is_empty() {
+            return run;
+        }
+
+        let (max_chars, max_count) = match engine {
+            Engine::Llm => (settings.max_batch_chars as usize, settings.max_batch_segments as usize),
+            _ => mt::batch_limits(engine),
+        };
+        let ctx = Ctx {
+            engine,
+            state,
+            backend,
+            settings,
+            target,
+            system: Self::system_prompt(target, &settings.extra_prompt, settings.json_mode),
+            requests: Mutex::new(0),
+            max_requests: misses.len() * 3 + 10,
+        };
+        let batches = make_batches(&misses, max_chars, max_count);
+        let conc = ctx.limits().0.clamp(1, 32) as usize;
+        let outcomes: Vec<BatchOutcome> = futures::stream::iter(batches)
+            .map(|b| {
+                let ctx = &ctx;
+                async move { self.translate_batch(ctx, b, 0, false).await }
+            })
+            .buffer_unordered(conc)
+            .collect()
+            .await;
+        let mut to_cache = Vec::new();
+        for o in outcomes {
+            for (id, text, quality) in o.good {
+                if quality == Quality::Source {
+                    run.kept.insert(id); // keeps its source text
+                    continue;
+                }
+                if let Some(s) = misses.iter().find(|s| s.id == id) {
+                    if quality == Quality::Good {
+                        to_cache.push((Self::cache_key(&cache_ns, target, &s.text), s.text.clone(), text.clone()));
+                    } else {
+                        run.degraded += 1;
+                    }
+                }
+                run.translations.insert(id, text);
+            }
+            run.failed.extend(o.failed);
+            // Batches that ended in an error still deliver what was validated before.
+            if let Some(e) = o.error
+                && run.error.is_none()
+            {
+                run.error = Some(e);
+            }
+        }
+        run.requests = *ctx.requests.lock().unwrap();
+        state.stats.lock().unwrap().segments_translated += to_cache.len() as u64;
+        // Keep what we got even if a batch failed: the next attempt hits the cache.
+        if let Err(e) = self.cache_put(model, lang::norm(target), to_cache).await
+            && run.error.is_none()
+        {
+            run.error = Some(TranslateError::Other(e.to_string()));
+        }
+        run
     }
 
     /// Call the model once with retries for transient errors, and parse the answer.
@@ -671,41 +916,47 @@ impl Translator {
             temperature,
             max_tokens: if ctx.settings.max_tokens > 0 { Some(ctx.settings.max_tokens) } else { None },
         };
+        let texts: Vec<String> = segs.iter().map(|s| s.text.clone()).collect();
+        let (max_concurrency, rpm) = ctx.limits();
+        let state = ctx.state;
         // How long a half-open probe may take before another request may probe.
         let probe_ttl = Duration::from_secs(ctx.settings.timeout_secs.max(10) as u64 + 60);
         let mut attempt = 0u32;
         loop {
-            let generation = self.breaker.lock().unwrap().admit(probe_ttl).map_err(TranslateError::CircuitOpen)?;
+            let generation = state.breaker.lock().unwrap().admit(probe_ttl).map_err(TranslateError::CircuitOpen)?;
             let (generation, res) = {
-                let _g = self.limiter.acquire(ctx.settings.max_concurrency, ctx.settings.requests_per_minute).await;
+                let _g = state.limiter.acquire(max_concurrency, rpm).await;
                 // The circuit may have opened while this request waited for a slot.
-                let generation = self.breaker.lock().unwrap().readmit(generation, probe_ttl).map_err(TranslateError::CircuitOpen)?;
-                (generation, ctx.backend.chat(req.clone()).await)
-            };
-            let res = match res {
-                Ok(r) => {
-                    {
-                        let mut st = self.stats.lock().unwrap();
-                        st.prompt_tokens += r.prompt_tokens;
-                        st.completion_tokens += r.completion_tokens;
-                    }
-                    parse_answer(&r, segs)
-                }
-                Err(e) => Err(self.reclassify(e, segs)),
+                let generation = state.breaker.lock().unwrap().readmit(generation, probe_ttl).map_err(TranslateError::CircuitOpen)?;
+                let res = match &ctx.backend {
+                    Backend::Chat(b) => match b.chat(req.clone()).await {
+                        Ok(r) => {
+                            {
+                                let mut st = state.stats.lock().unwrap();
+                                st.prompt_tokens += r.prompt_tokens;
+                                st.completion_tokens += r.completion_tokens;
+                            }
+                            parse_answer(&r, segs)
+                        }
+                        Err(e) => Err(self.reclassify(state, e, segs)),
+                    },
+                    Backend::Mt(b) => b.translate(texts.clone(), ctx.target.to_string()).await.and_then(|out| mt_answer(out, segs)),
+                };
+                (generation, res)
             };
             match res {
                 Ok(answer) => {
-                    self.breaker.lock().unwrap().success(generation);
-                    let mut st = self.stats.lock().unwrap();
+                    state.breaker.lock().unwrap().success(generation);
+                    let mut st = state.stats.lock().unwrap();
                     st.requests += 1;
                     st.last_success_at = Some(util::now());
                     st.last_failed = false;
                     return Ok(answer);
                 }
                 Err(e) => {
-                    let opened = self.breaker.lock().unwrap().failure(generation, &e);
+                    let opened = state.breaker.lock().unwrap().failure(generation, &e);
                     {
-                        let mut st = self.stats.lock().unwrap();
+                        let mut st = state.stats.lock().unwrap();
                         st.requests += 1;
                         st.failures += 1;
                         st.last_error = Some(e.to_string());
@@ -738,11 +989,11 @@ impl Translator {
     /// Errors whose meaning depends on the request: a context-length error for a small
     /// request, or an unrecognized rejection repeated for unrelated segments, comes from
     /// the configuration and needs the operator.
-    fn reclassify(&self, e: ApiError, segs: &[&Segment]) -> ApiError {
+    fn reclassify(&self, state: &EngineState, e: ApiError, segs: &[&Segment]) -> ApiError {
         if e.is_context_length() && segs.iter().map(|s| s.text.chars().count()).sum::<usize>() <= SMALL_REQUEST_CHARS {
             return ApiError::Config { detail: e.to_string(), hint: llm::HINT_TOO_LARGE };
         }
-        if e.is_ambiguous() && self.rejections.lock().unwrap().repeated(&e, segs) {
+        if e.is_ambiguous() && state.rejections.lock().unwrap().repeated(&e, segs) {
             return ApiError::Config { detail: e.to_string(), hint: llm::HINT_CONFIG };
         }
         e
@@ -778,7 +1029,7 @@ impl Translator {
                     outcome.failed.push((batch[0].id, p));
                     return outcome;
                 }
-                Err(TranslateError::Api(ApiError::Unparseable { .. })) if self.circuit_open_for().is_none() => {
+                Err(TranslateError::Api(ApiError::Unparseable { .. })) if ctx.state.open_for().is_none() => {
                     tracing::debug!(segments = batch.len(), "unusable translation output");
                     // Smaller requests often work (one refused segment, an answer too long
                     // for the output budget); unusable answers count toward the breaker,
@@ -872,7 +1123,8 @@ impl Translator {
                     self.translate_batch(ctx, bad, 0, true).await
                 }
             } else {
-                let seg_tries = if batch.len() > 1 { 1 } else { tries + 1 };
+                // Machine translation answers the same request the same way.
+                let seg_tries = if ctx.engine != Engine::Llm { MAX_SINGLE_TRIES } else if batch.len() > 1 { 1 } else { tries + 1 };
                 if seg_tries < MAX_SINGLE_TRIES {
                     self.translate_batch(ctx, bad, seg_tries, true).await
                 } else {
@@ -921,7 +1173,8 @@ impl Translator {
 
     /// Quick connectivity/quality test used by the admin UI.
     pub async fn test(&self, settings: &TranslationSettings, target: &str, html: &str) -> Result<ArticleTranslation, TranslateError> {
-        self.translate_article(settings, target, Some("Test title"), html, false).await
+        // The fallback steps in at once, as on an article's last attempt.
+        self.translate_article_with(settings, target, Some("Test title"), html, false, true).await
     }
 
     /// Delete cache entries unused for `days`.
@@ -929,6 +1182,15 @@ impl Translator {
         let cutoff = util::now() - days as i64 * 86400;
         self.db.call(move |c| Ok(c.execute("DELETE FROM translations WHERE used_at < ?", [cutoff])?)).await
     }
+}
+
+/// Machine-translation output: one string per segment, in order.
+fn mt_answer(out: Vec<String>, segs: &[&Segment]) -> Result<Answer, ApiError> {
+    if out.len() != segs.len() {
+        return Err(ApiError::BadResponse(format!("请求 {} 段，返回 {} 段", segs.len(), out.len())));
+    }
+    // Positional ids (see translate_batch).
+    Ok(Answer { pairs: out.into_iter().enumerate().map(|(i, t)| (usize::MAX - i, t)).collect(), truncated: false })
 }
 
 /// Parse a model answer, or tell why it cannot be used.
