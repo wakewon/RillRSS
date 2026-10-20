@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# RillRSS .gitignore — never commit personal data, secrets or runtime state.
+# ---------------------------------------------------------------------------
+
+# Build output
+/target/
+**/*.rs.bk
+
+# Runtime data directory (SQLite DB, image cache, icons, backups ...)
+/data/
+/data-*/
+/rill-data/
+/var/
+
+# Any database file anywhere in the tree
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Subscription lists (personal). Only synthetic test fixtures are allowed.
+*.opml
+!tests/fixtures/**/*.opml
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+config.toml
+config.local.toml
+*.local.toml
+!config.example.toml
+secrets/
+*.pem
+*.key
+*.p12
+*.crt
+
+# Caches, logs and test scratch data
+/cache/
+/images/
+/icons/
+/logs/
+*.log
+/scratch/
+/tmp/
+/test-output/
+/tests/live-output/
+docker-compose.override.yml
+compose.override.yml
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
