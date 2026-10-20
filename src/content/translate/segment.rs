@@ -24,6 +24,9 @@ const INLINE_PAIRED: &[&str] = &[
 const INLINE_ATOMIC: &[&str] = &["br", "img", "wbr", "code", "kbd", "samp", "var", "math", "svg", "video", "audio", "picture", "input"];
 /// Containers whose text must never be translated.
 const NO_TRANSLATE: &[&str] = &["pre", "script", "style", "noscript", "template", "textarea", "table-of-contents"];
+/// Markup nested deeper than this (broken or hostile) stays as it is: the segmenter
+/// recurses and must not overflow the stack.
+const MAX_DEPTH: usize = 100;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Placeholder {
@@ -112,7 +115,7 @@ impl Builder {
         (open, format!("</{name}>"))
     }
 
-    fn serialize(&mut self, n: &NodeRef, out: &mut String) {
+    fn serialize(&mut self, n: &NodeRef, out: &mut String, depth: usize) {
         if n.is_text() {
             out.push_str(&escape_text(&n.text()));
             return;
@@ -121,7 +124,7 @@ impl Builder {
             return;
         }
         let name = tag_name(n).unwrap_or_default();
-        if INLINE_ATOMIC.contains(&name.as_str()) || NO_TRANSLATE.contains(&name.as_str()) {
+        if depth > MAX_DEPTH || INLINE_ATOMIC.contains(&name.as_str()) || NO_TRANSLATE.contains(&name.as_str()) {
             self.counter += 1;
             let id = self.counter;
             self.placeholders.insert(id, Placeholder::Atom(n.html().to_string()));
@@ -142,7 +145,7 @@ impl Builder {
         self.placeholders.insert(id, Placeholder::Pair { open, close });
         out.push_str(&format!("<g{id}>"));
         for c in n.children() {
-            self.serialize(&c, out);
+            self.serialize(&c, out, depth + 1);
         }
         out.push_str(&format!("</g{id}>"));
     }
@@ -179,7 +182,7 @@ fn make_segment(id: usize, nodes: &[NodeRef]) -> Option<Segment> {
     let mut b = Builder { counter: 0, placeholders: HashMap::new() };
     let mut text = String::new();
     for n in nodes {
-        b.serialize(n, &mut text);
+        b.serialize(n, &mut text, 0);
     }
     let text = normalize_space(&text);
     if !worth_translating(&strip_placeholders(&text)) {
@@ -197,19 +200,22 @@ pub fn segment_html(html: &str) -> Segmented {
         Some(h) if h.node_name().as_deref() == Some("html") => h,
         _ => doc.root(),
     };
-    walk(&root, &mut targets, &mut segments, true);
+    walk(&root, &mut targets, &mut segments, 0);
     Segmented { doc, targets, segments }
 }
 
-fn walk(node: &NodeRef, targets: &mut Vec<Target>, segments: &mut Vec<Segment>, is_root: bool) {
+fn walk(node: &NodeRef, targets: &mut Vec<Target>, segments: &mut Vec<Segment>, depth: usize) {
     if let Some(name) = tag_name(node)
         && (NO_TRANSLATE.contains(&name.as_str()) || INLINE_ATOMIC.contains(&name.as_str()))
     {
         return;
     }
+    if depth > MAX_DEPTH {
+        return;
+    }
     let children = node.children();
     let all_inline = children.iter().all(is_inline);
-    if all_inline && !is_root {
+    if all_inline && depth > 0 {
         if let Some(seg) = make_segment(segments.len() + 1, &children) {
             targets.push(Target::Element(node.id));
             segments.push(seg);
@@ -233,7 +239,7 @@ fn walk(node: &NodeRef, targets: &mut Vec<Target>, segments: &mut Vec<Segment>, 
             run.push(c);
         } else {
             flush(&mut run, targets, segments);
-            walk(&c, targets, segments, false);
+            walk(&c, targets, segments, depth + 1);
         }
     }
     flush(&mut run, targets, segments);
@@ -373,35 +379,91 @@ fn sanitize_text_chunk(s: &str) -> String {
     escape_text(&decoded)
 }
 
+/// Does the node or an ancestor declare a language or a text direction?
+fn declares_lang(n: &NodeRef) -> bool {
+    let declares = |x: &NodeRef| x.has_attr("lang") || x.has_attr("dir");
+    declares(n) || n.ancestors_it(None).any(|a| declares(&a))
+}
+
+/// Tags for the translated copy of a block (bilingual mode): the original's attributes
+/// except `id` (ids must stay unique), relabelled with the target language if needed.
+fn translation_tag(n: &NodeRef, label: Option<(&str, &str)>) -> (String, String) {
+    let name = tag_name(n).unwrap_or_else(|| "span".into());
+    let mut open = format!("<{name}");
+    for a in n.attrs() {
+        let key: &str = &a.name.local;
+        if key == "id" || (label.is_some() && matches!(key, "lang" | "dir")) {
+            continue;
+        }
+        open.push_str(&format!(" {key}=\"{}\"", escape(&a.value)));
+    }
+    if let Some((lang, dir)) = label {
+        open.push_str(&format!(" lang=\"{}\" dir=\"{dir}\"", escape(lang)));
+    }
+    open.push('>');
+    (open, format!("</{name}>"))
+}
+
+/// Wrap translated inline content in the target language, if needed.
+fn labelled(html: String, label: Option<(&str, &str)>) -> String {
+    match label {
+        Some((lang, dir)) => format!("<span lang=\"{}\" dir=\"{dir}\">{html}</span>", escape(lang)),
+        None => html,
+    }
+}
+
+/// Remove `id` attributes from generated markup (its text never contains a raw `<`).
+fn strip_ids(html: &str) -> String {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(<[A-Za-z][^<>]*?)\s+id\s*=\s*"[^"]*""#).unwrap());
+    RE.replace_all(html, "$1").into_owned()
+}
+
 impl Segmented {
-    /// Apply translations (segment id -> translated text with placeholders).
-    /// `bilingual` keeps the original and adds the translation after it.
-    pub fn apply(self, translations: &HashMap<usize, String>, bilingual: bool) -> String {
+    /// Apply translations (segment id -> translated text with placeholders) into language
+    /// `lang`. `bilingual` keeps the original and adds the translation after it.
+    pub fn apply(self, translations: &HashMap<usize, String>, bilingual: bool, lang: &str) -> String {
+        let lang = lang.trim().replace('_', "-");
+        let dir = super::lang::direction(&lang);
         for (seg, target) in self.segments.iter().zip(self.targets.iter()) {
             let Some(tr) = translations.get(&seg.id) else { continue };
-            let html = restore(seg, tr);
+            let mut html = restore(seg, tr);
+            if bilingual {
+                // The original keeps its ids.
+                html = strip_ids(&html);
+            }
             match target {
                 Target::Element(id) => {
                     let node = NodeRef::new(*id, &self.doc.tree);
+                    // The source's language and direction must not apply to the translation
+                    // (and a right-to-left target needs its direction anyway).
+                    let label = (dir == "rtl" || declares_lang(&node)).then_some((lang.as_str(), dir));
                     if bilingual {
                         let name = tag_name(&node).unwrap_or_default();
                         if matches!(name.as_str(), "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "div" | "dd" | "dt" | "section" | "header" | "footer" | "article" | "aside") {
-                            let (open, close) = Builder::open_tag_html(&node);
+                            let (open, close) = translation_tag(&node, label);
                             node.after_html(format!("{open}{html}{close}"));
                         } else {
-                            node.append_html(format!("<br>{html}"));
+                            node.append_html(format!("<br>{}", labelled(html, label)));
                         }
                     } else {
                         node.set_html(html);
+                        if let Some((lang, dir)) = label {
+                            node.set_attr("lang", lang);
+                            node.set_attr("dir", dir);
+                        }
                     }
                 }
                 Target::Run(ids) => {
                     let Some(first) = ids.first() else { continue };
                     let last = ids.last().unwrap();
+                    let first = NodeRef::new(*first, &self.doc.tree);
+                    let label = (dir == "rtl" || first.parent().is_some_and(|p| declares_lang(&p))).then_some((lang.as_str(), dir));
+                    let html = labelled(html, label);
                     if bilingual {
                         NodeRef::new(*last, &self.doc.tree).after_html(format!("<br>{html}"));
                     } else {
-                        NodeRef::new(*first, &self.doc.tree).before_html(html);
+                        first.before_html(html);
                         for id in ids {
                             NodeRef::new(*id, &self.doc.tree).remove_from_parent();
                         }
@@ -439,7 +501,7 @@ mod tests {
         tr.insert(1, "Texte d'intro <g1>gras</g1>".to_string());
         tr.insert(2, "Paragraphe".to_string());
         tr.insert(3, "texte de fin".to_string());
-        let out = s.apply(&tr, false);
+        let out = s.apply(&tr, false, "fr");
         assert_eq!(out, "<div>Texte d'intro <b>gras</b><p>Paragraphe</p>texte de fin</div>");
     }
 
@@ -467,7 +529,66 @@ mod tests {
         let mut tr = HashMap::new();
         tr.insert(1, "你好".into());
         tr.insert(2, "项目".into());
-        assert_eq!(s.apply(&tr, true), "<p>Hello</p><p>你好</p><ul><li>Item<br>项目</li></ul>");
+        assert_eq!(s.apply(&tr, true, "zh-CN"), "<p>Hello</p><p>你好</p><ul><li>Item<br>项目</li></ul>");
+    }
+
+    #[test]
+    fn translations_take_the_target_language() {
+        // The source's direction/language must not apply to the translation.
+        let h = "<div dir=\"rtl\" lang=\"ar\"><p>مرحبا بالعالم</p>نص حر</div><h2 id=\"sec\" lang=\"en\">Budget</h2><p>Plain</p>";
+        let mut tr = HashMap::new();
+        tr.insert(1, "你好世界".to_string());
+        tr.insert(2, "自由文本".to_string());
+        tr.insert(3, "预算".to_string());
+        tr.insert(4, "普通".to_string());
+        assert_eq!(
+            segment_html(h).apply(&tr, false, "zh-CN"),
+            "<div dir=\"rtl\" lang=\"ar\"><p lang=\"zh-CN\" dir=\"ltr\">你好世界</p><span lang=\"zh-CN\" dir=\"ltr\">自由文本</span></div>\
+             <h2 id=\"sec\" lang=\"zh-CN\" dir=\"ltr\">预算</h2><p>普通</p>"
+        );
+        // Bilingual copies keep their attributes but no duplicate ids.
+        let h = "<h2 id=\"sec\" class=\"t\">Budget <a id=\"fn1\" href=\"#n1\">1</a> now</h2><ul><li lang=\"en\">Item</li></ul>";
+        let s = segment_html(h);
+        assert_eq!(s.segments[0].text, "Budget <g1>1</g1> now");
+        let mut tr = HashMap::new();
+        tr.insert(1, "预算 <g1>1</g1> 现在".to_string());
+        tr.insert(2, "项目".to_string());
+        assert_eq!(
+            s.apply(&tr, true, "zh-CN"),
+            "<h2 id=\"sec\" class=\"t\">Budget <a id=\"fn1\" href=\"#n1\">1</a> now</h2><h2 class=\"t\">预算 <a href=\"#n1\">1</a> 现在</h2>\
+             <ul><li lang=\"en\">Item<br><span lang=\"zh-CN\" dir=\"ltr\">项目</span></li></ul>"
+        );
+        // A right-to-left target is marked even when the source declares nothing.
+        let s = segment_html("<p>Hello</p>");
+        let mut tr = HashMap::new();
+        tr.insert(1, "مرحبا".to_string());
+        assert_eq!(s.apply(&tr, false, "ar"), "<p lang=\"ar\" dir=\"rtl\">مرحبا</p>");
+    }
+
+    #[test]
+    fn deep_nesting_does_not_overflow() {
+        // Thousands of nested blocks or inline elements (broken or hostile markup) must
+        // not overflow the stack; what lies beyond the depth limit stays untranslated.
+        let n = 6000;
+        let blocks = format!("{}<p>Deep paragraph text here.</p>{}", "<div>".repeat(n), "</div>".repeat(n));
+        let inline = format!("<p>Top level text {}deep{} end.</p>", "<span>".repeat(n), "</span>".repeat(n));
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let s = segment_html(&blocks);
+                assert!(s.segments.is_empty());
+                assert!(s.apply(&HashMap::new(), false, "zh-CN").contains("Deep paragraph text here."));
+                let s = segment_html(&inline);
+                assert_eq!(s.segments.len(), 1);
+                assert!(s.segments[0].text.starts_with("Top level text "));
+                let mut tr = HashMap::new();
+                tr.insert(1, s.segments[0].text.replacen("Top level text", "顶层文本", 1));
+                let out = s.apply(&tr, false, "zh-CN");
+                assert!(out.starts_with("<p>顶层文本 ") && out.contains("deep"));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -476,7 +597,7 @@ mod tests {
         assert_eq!(s.segments[0].text, "AT&amp;T &lt;rocks&gt;");
         let mut tr = HashMap::new();
         tr.insert(1, "AT&T <rocks> 很棒".into());
-        assert_eq!(s.apply(&tr, false), "<p>AT&amp;T &lt;rocks&gt; 很棒</p>");
+        assert_eq!(s.apply(&tr, false, "zh-CN"), "<p>AT&amp;T &lt;rocks&gt; 很棒</p>");
     }
 
     #[test]

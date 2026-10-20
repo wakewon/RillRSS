@@ -2,8 +2,16 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::http::{StatusCode, header};
+use axum::routing::post;
 use common::*;
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn tr_settings(mock: &Mock) -> impl FnOnce(&mut rillrss::settings::Settings) + '_ {
     move |s| {
@@ -101,22 +109,93 @@ async fn persistent_failure_publishes_original_with_note() {
 }
 
 #[tokio::test]
-async fn unusable_output_publishes_partial_translation_with_note() {
+async fn persistently_unusable_output_pauses_translation() {
+    // A model that never answers in the requested format: paused with a hint after a few
+    // requests, instead of ~3 requests per segment on every attempt.
     let mock = start_mock().await;
-    let t = start_app(|s| {
-        tr_settings(&mock)(s);
-        s.translation.max_attempts = 2;
-    })
-    .await;
+    let t = start_app(tr_settings(&mock)).await;
     mock.script_llm(vec![LlmMode::Garbage; 1000]);
     mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
     let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
     t.fetch(fid).await;
+    wait_for_pause(&t).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(mock.llm_calls() <= 8, "no retry storm: {} calls", mock.llm_calls());
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 0);
+    assert!(t.app.translator.stats().pause_hint.is_some_and(|h| h.contains("格式")));
+    // A working model (saving settings resets the circuit): published translated.
+    mock.script_llm(vec![]);
+    t.app.translator.reset_circuit();
+    t.app.db.call(|c| Ok(c.execute("UPDATE revisions SET next_attempt_at = 0", [])?)).await.unwrap();
     t.wait_idle().await;
-    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 1);
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(!content.contains("prime minister"));
+}
+
+#[tokio::test]
+async fn partly_unusable_output_publishes_partial_translation_with_note() {
+    // The model refuses one paragraph every time: the rest is translated, published with a
+    // note after the last attempt, and translation is not paused.
+    let mock = start_mock().await;
+    let (url, _calls) = llm_mock(|user| if user.contains("Opposition parties") { refusal() } else { completion(user) }).await;
+    let t = start_app(|s| {
+        llm_settings(&url)(s);
+        s.translation.max_attempts = 2;
+    })
+    .await;
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(content.contains("Opposition parties") && !content.contains("prime minister"), "{content}");
     let notes: String = t.query("SELECT notes FROM revisions", |r| r.get(0)).await;
     assert!(notes.contains("翻译不完整"), "{notes}");
-    assert!(t.app.translator.circuit_open_for().is_none(), "bad output does not pause the service");
+    assert!(t.app.translator.circuit_open_for().is_none(), "a refused paragraph does not pause the service");
+}
+
+#[tokio::test]
+async fn moderation_rejection_keeps_the_rest_of_the_article() {
+    // DeepSeek rejects one paragraph ("Content Exists Risk"): only that one stays in the
+    // source language and nothing is paused.
+    let mock = start_mock().await;
+    let risk = json!({"error": {"message": "Content Exists Risk", "type": "invalid_request_error", "param": null, "code": "invalid_request_error"}}).to_string();
+    let (url, _calls) = llm_mock(move |user| if user.contains("Opposition parties") { (400, risk.clone()) } else { completion(user) }).await;
+    let t = start_app(|s| {
+        llm_settings(&url)(s);
+        s.translation.max_attempts = 2;
+    })
+    .await;
+    mock.set("/en.xml", "application/rss+xml", rss("English", &[entry("e1", "Taxes to rise", "https://news.example.com/e1", ARTICLE)]));
+    let fid = t.add_feed(&mock.url("/en.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    t.wait_idle().await;
+    let content: String = t.query("SELECT content FROM items", |r| r.get(0)).await;
+    assert!(content.contains("Opposition parties") && !content.contains("prime minister"), "{content}");
+    assert!(t.app.translator.circuit_open_for().is_none());
+}
+
+#[tokio::test]
+async fn context_errors_caused_by_max_tokens_pause_instead_of_splitting() {
+    // max_tokens as large as the model's window (vLLM): every request fails however
+    // small. Paused at once with a max_tokens hint instead of bisecting every batch.
+    let mock = start_mock().await;
+    let error = json!({"object": "error", "message": "This model's maximum context length is 4096 tokens. However, you requested 4610 tokens (514 in the messages, 4096 in the completion). Please reduce the length of the messages or completion.", "type": "BadRequestError", "param": null, "code": 400}).to_string();
+    let (url, calls) = llm_mock(move |_| (400, error.clone())).await;
+    let t = start_app(|s| {
+        llm_settings(&url)(s);
+        s.translation.max_tokens = 4096;
+    })
+    .await;
+    let entries: Vec<Entry> = (0..3).map(|i| entry(&format!("c{i}"), &format!("Story {i}"), &format!("https://news.example.com/c{i}"), ARTICLE)).collect();
+    mock.set("/cfg.xml", "application/rss+xml", rss("Cfg", &entries));
+    let fid = t.add_feed(&mock.url("/cfg.xml"), json!({"translate": true})).await;
+    t.fetch(fid).await;
+    wait_for_pause(&t).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(calls.load(Ordering::SeqCst) <= 4, "no retry storm: {} calls", calls.load(Ordering::SeqCst));
+    assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 0);
+    assert!(t.app.translator.stats().pause_hint.is_some_and(|h| h.contains("max_tokens")));
 }
 
 #[tokio::test]
@@ -249,4 +328,70 @@ async fn invalid_parameter_errors_pause_instead_of_retry_storm() {
     assert_eq!(t.count("SELECT COUNT(*) FROM items").await, 3);
     let content: String = t.query("SELECT content FROM items LIMIT 1", |r| r.get(0)).await;
     assert!(!content.contains("prime minister"));
+}
+
+fn llm_settings(url: &str) -> impl FnOnce(&mut rillrss::settings::Settings) + '_ {
+    move |s| {
+        s.translation.base_url = url.to_string();
+        s.translation.model = "mock-model".into();
+        s.translation.api_key = "test-key".into();
+        s.translation.max_batch_segments = 4;
+        s.translation.max_attempts = 3;
+    }
+}
+
+async fn wait_for_pause(t: &TestApp) {
+    for _ in 0..100 {
+        if t.app.translator.circuit_open_for().is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("translation was not paused");
+}
+
+/// A chat-completions endpoint answering `f(user prompt) -> (status, body)`; returns its
+/// base URL and request counter.
+async fn llm_mock(f: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let f = Arc::new(f);
+    let counter = calls.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Bytes| {
+            let (f, counter) = (f.clone(), counter.clone());
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let req: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let (status, body) = f(req["messages"][1]["content"].as_str().unwrap_or(""));
+                (StatusCode::from_u16(status).unwrap(), [(header::CONTENT_TYPE, "application/json")], body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), calls)
+}
+
+/// A completion translating every `<seg>` of the prompt.
+fn completion(user: &str) -> (u16, String) {
+    let re = regex::Regex::new(r#"(?s)<seg id="(\d+)">(.*?)</seg>"#).unwrap();
+    let content: String = re.captures_iter(user).map(|c| format!("<seg id=\"{}\">{}</seg>\n", &c[1], pseudo_translate(&c[2]))).collect();
+    chat_response(&content)
+}
+
+fn refusal() -> (u16, String) {
+    chat_response("Sorry, I can't help with that.")
+}
+
+fn chat_response(content: &str) -> (u16, String) {
+    let resp = json!({
+        "id": "mock", "object": "chat.completion", "model": "mock-model",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 10}
+    });
+    (200, resp.to_string())
 }

@@ -551,6 +551,7 @@ async fn dashboard(State(app): State<AppRef>, headers: HeaderMap, Query(q): Quer
     st.tr_configured = settings.translation.is_configured();
     st.tr_model = settings.translation.model.clone();
     st.tr_circuit = app.translator.circuit_open_for().map(|d| match d.as_secs() {
+        0 => String::new(), // half-open: the probe request is in flight
         s if s < 90 => format!("{s} 秒"),
         s => format!("{} 分钟", s.div_ceil(60)),
     });
@@ -562,16 +563,22 @@ async fn dashboard(State(app): State<AppRef>, headers: HeaderMap, Query(q): Quer
     st.tr_in_flight = app.translator.in_flight();
     // Health reflects the latest outcome, not just whether the circuit is open: a
     // service that fails every request must not show as "正常".
-    let failing = ts.last_error_at.is_some_and(|e| ts.last_success_at.is_none_or(|ok| e > ok));
+    let failing = ts.last_failed;
     (st.tr_state, st.tr_state_label) = match &st.tr_circuit {
+        Some(c) if c.is_empty() => ("err", "已暂停 · 正在试探恢复".into()),
         Some(c) => ("err", format!("已暂停 · {c}后自动重试")),
         None if failing => ("err", "最近请求失败".into()),
         None if ts.requests == 0 => ("idle", "待命".into()),
         None => ("ok", "正常".into()),
     };
     let show_error = failing || st.tr_circuit.is_some();
-    st.tr_last_error = ts.last_error.filter(|_| show_error).map(|e| format!("{}（{}）", truncate_chars(&e, 240), fmt_relative(ts.last_error_at)));
-    st.tr_hint = ts.last_error_hint.filter(|_| show_error);
+    // While paused, show the error that paused translation, not whatever failed last.
+    let (error, hint, at) = match (&st.tr_circuit, ts.pause_error) {
+        (Some(_), Some(e)) => (Some(e), ts.pause_hint, ts.pause_at),
+        _ => (ts.last_error, ts.last_error_hint, ts.last_error_at),
+    };
+    st.tr_last_error = error.filter(|_| show_error).map(|e| format!("{}（{}）", truncate_chars(&e, 240), fmt_relative(at)));
+    st.tr_hint = hint.filter(|_| show_error);
     let queue_total: i64 = stages.iter().map(|r| r.due + r.waiting).sum();
     let max = stages.iter().map(|r| r.due + r.waiting).max().unwrap_or(0).max(1);
     for r in &mut stages {

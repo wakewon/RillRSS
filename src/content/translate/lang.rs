@@ -79,6 +79,14 @@ pub fn is_cjk(code: &str) -> bool {
     matches!(norm(code).split('-').next().unwrap_or(""), "zh" | "ja" | "ko")
 }
 
+/// Text direction of a language ("rtl" for Arabic, Hebrew, Persian, Urdu…).
+pub fn direction(code: &str) -> &'static str {
+    match norm(code).split('-').next().unwrap_or("") {
+        "ar" | "fa" | "he" | "iw" | "ur" | "ps" | "sd" | "ug" | "yi" | "dv" | "ckb" => "rtl",
+        _ => "ltr",
+    }
+}
+
 /// Detect the language of a text; returns None when unreliable.
 pub fn detect(text: &str) -> Option<Lang> {
     let info = whatlang::detect(text)?;
