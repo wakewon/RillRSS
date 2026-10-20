@@ -1,0 +1,184 @@
+//! Periodic cleanup: article retention, superseded versions, old revisions, orphaned
+//! stories, image cache GC, translation cache pruning, event log trimming.
+
+use std::time::Duration;
+
+use anyhow::Result;
+use rusqlite::params;
+use serde::Serialize;
+
+use crate::app::{AppRef, EventRef, Level};
+use crate::settings::FeedOptions;
+use crate::util;
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct CleanupReport {
+    pub items_deleted: usize,
+    pub superseded_deleted: usize,
+    pub revisions_deleted: usize,
+    pub stories_deleted: usize,
+    pub images_deleted: usize,
+    pub image_bytes_freed: i64,
+    pub translations_deleted: usize,
+    pub events_deleted: usize,
+    pub sessions_deleted: usize,
+}
+
+impl CleanupReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "deleted {} articles, {} old versions, {} revisions, {} stories, {} images ({}), {} cached translations, {} events, {} sessions",
+            self.items_deleted,
+            self.superseded_deleted,
+            self.revisions_deleted,
+            self.stories_deleted,
+            self.images_deleted,
+            util::human_bytes(self.image_bytes_freed.max(0) as u64),
+            self.translations_deleted,
+            self.events_deleted,
+            self.sessions_deleted
+        )
+    }
+}
+
+pub async fn run_maintenance(app: AppRef) {
+    // First run shortly after start, then hourly.
+    let mut delay = Duration::from_secs(300);
+    loop {
+        tokio::select! {
+            _ = app.shutdown.cancelled() => break,
+            _ = tokio::time::sleep(delay) => {},
+        }
+        delay = Duration::from_secs(3600);
+        match cleanup(&app).await {
+            Ok(r) => {
+                if r.items_deleted + r.superseded_deleted + r.images_deleted + r.stories_deleted > 0 {
+                    app.event(Level::Info, "cleanup", EventRef::default(), r.summary()).await;
+                }
+            }
+            Err(e) => app.event(Level::Error, "cleanup", EventRef::default(), format!("cleanup failed: {e:#}")).await,
+        }
+    }
+}
+
+/// Run all cleanup tasks once.
+pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
+    let settings = app.settings.get().await;
+    let r = settings.retention.clone();
+    let now = util::now();
+    let mut report = CleanupReport::default();
+
+    // Per-feed retention.
+    let feeds: Vec<(i64, String)> = app
+        .db
+        .call(|c| {
+            let mut st = c.prepare("SELECT id, options FROM feeds")?;
+            let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await?;
+    for (feed_id, opts) in feeds {
+        let o = FeedOptions::from_json(&opts);
+        let days = o.retention_days.unwrap_or(r.days);
+        let keep_unread = r.keep_unread;
+        let max_items = r.max_items_per_feed;
+        let n = app
+            .db
+            .write(move |tx| {
+                let mut n = 0;
+                if days > 0 {
+                    let cutoff_us = (now - days as i64 * 86400) * 1_000_000;
+                    n += tx.execute(
+                        "DELETE FROM items WHERE feed_id = ? AND created_at < ? AND is_starred = 0 AND (? = 0 OR is_read = 1 OR hidden = 1)",
+                        params![feed_id, cutoff_us, keep_unread as i64],
+                    )?;
+                }
+                if max_items > 0 {
+                    n += tx.execute(
+                        "DELETE FROM items WHERE feed_id = ?1 AND is_starred = 0 AND id NOT IN (
+                             SELECT id FROM items WHERE feed_id = ?1 AND hidden = 0 ORDER BY id DESC LIMIT ?2)
+                           AND (?3 = 0 OR is_read = 1 OR hidden = 1)",
+                        params![feed_id, max_items as i64, keep_unread as i64],
+                    )?;
+                }
+                Ok(n)
+            })
+            .await?;
+        report.items_deleted += n;
+    }
+
+    // Superseded versions.
+    let sup_cutoff = (now - r.superseded_days as i64 * 86400) * 1_000_000;
+    report.superseded_deleted = app
+        .db
+        .write(move |tx| Ok(tx.execute("DELETE FROM items WHERE hidden = 1 AND superseded_by IS NOT NULL AND is_starred = 0 AND created_at < ?", [sup_cutoff])?))
+        .await?;
+
+    // Finished revisions (keep the newest per story: it carries the entry data used for
+    // reprocessing and page updates).
+    let rev_cutoff = now - 7 * 86400;
+    report.revisions_deleted = app
+        .db
+        .write(move |tx| {
+            Ok(tx.execute(
+                "DELETE FROM revisions WHERE state <> 'pending' AND updated_at < ?
+                   AND id NOT IN (SELECT MAX(id) FROM revisions GROUP BY story_id)",
+                [rev_cutoff],
+            )?)
+        })
+        .await?;
+
+    // Stories that left the feed long ago and have no articles left.
+    let story_cutoff = now - (r.days.max(7) as i64 + 7) * 86400;
+    report.stories_deleted = app
+        .db
+        .write(move |tx| {
+            Ok(tx.execute(
+                "DELETE FROM stories WHERE last_seen_at < ?
+                   AND NOT EXISTS (SELECT 1 FROM items i WHERE i.story_id = stories.id)
+                   AND NOT EXISTS (SELECT 1 FROM revisions v WHERE v.story_id = stories.id AND v.state = 'pending')",
+                [story_cutoff],
+            )?)
+        })
+        .await?;
+
+    // Image cache.
+    let (n, freed) = app.images.gc(86400).await?;
+    report.images_deleted = n;
+    report.image_bytes_freed = freed;
+    let failed_cutoff = now - 30 * 86400;
+    app.db
+        .call(move |c| Ok(c.execute("DELETE FROM image_sources WHERE status <> 'ok' AND fetched_at < ?", [failed_cutoff])?))
+        .await?;
+
+    // Translation cache.
+    if r.translation_cache_days > 0 {
+        report.translations_deleted = app.translator.prune_cache(r.translation_cache_days).await?;
+    }
+
+    // Event log and sessions.
+    let keep = r.event_rows.max(100) as i64;
+    report.events_deleted = app
+        .db
+        .call(move |c| Ok(c.execute("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?", [keep])?))
+        .await?;
+    let api_cutoff = now - 365 * 86400;
+    report.sessions_deleted = app
+        .db
+        .call(move |c| {
+            Ok(c.execute(
+                "DELETE FROM sessions WHERE (expires_at IS NOT NULL AND expires_at < ?) OR (kind <> 'web' AND last_used_at < ?)",
+                params![now, api_cutoff],
+            )?)
+        })
+        .await?;
+
+    app.db
+        .call(|c| {
+            c.execute_batch("PRAGMA incremental_vacuum(4000); PRAGMA optimize;")?;
+            let _ = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            Ok(())
+        })
+        .await?;
+    Ok(report)
+}

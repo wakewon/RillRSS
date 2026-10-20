@@ -111,7 +111,7 @@ impl Default for RetentionSettings {
             days: 30,
             keep_unread: false,
             max_items_per_feed: 0,
-            superseded_days: 7,
+            superseded_days: 31,
             translation_cache_days: 60,
             event_rows: 5000,
         }
@@ -176,8 +176,8 @@ impl Default for TranslationSettings {
             requests_per_minute: 30,
             timeout_secs: 180,
             temperature: 0.2,
-            max_batch_chars: 2400,
-            max_batch_segments: 30,
+            max_batch_chars: 4000,
+            max_batch_segments: 16,
             max_tokens: 0,
             json_mode: false,
             extra_prompt: String::new(),
@@ -240,8 +240,19 @@ pub struct UpdateSettings {
     pub title_prefix: String,
     /// Insert a small "updated" notice at the top of updated versions.
     pub notice: bool,
+    /// Text of the notice.
+    pub notice_label: String,
+    /// Label for the previous version's date in the notice.
+    pub previous_label: String,
     /// Updated versions are unread even if the previous version was read.
     pub mark_unread: bool,
+    /// Use the update time as the publication date of updated versions (so they sort
+    /// to the top in readers). When false the original date is kept.
+    pub redate: bool,
+    /// Hide superseded versions from article lists (they stay fetchable by id). Off by
+    /// default: some clients (Read You, Newsboat) only learn that the old version is
+    /// read while it is still listed.
+    pub hide_superseded: bool,
 }
 
 impl Default for UpdateSettings {
@@ -255,9 +266,13 @@ impl Default for UpdateSettings {
             min_changed_tokens: 25,
             major_added_tokens: 80,
             title_only_triggers: false,
-            title_prefix: "[更新] ".into(),
+            title_prefix: "[更新]".into(),
             notice: true,
+            notice_label: "本文已更新".into(),
+            previous_label: "首发于".into(),
             mark_unread: true,
+            redate: true,
+            hide_superseded: false,
         }
     }
 }

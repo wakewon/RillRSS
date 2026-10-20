@@ -35,20 +35,37 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Quota / billing exhaustion (often reported as 429) — retrying will not help.
+    pub fn is_quota(&self) -> bool {
+        match self {
+            ApiError::Http { status, body, .. } => {
+                *status == 402
+                    || (*status == 429 && {
+                        let b = body.to_ascii_lowercase();
+                        b.contains("insufficient_quota") || b.contains("exceeded_current_quota") || b.contains("billing") || b.contains("balance")
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// Errors worth retrying with the same request.
     pub fn is_transient(&self) -> bool {
+        if self.is_quota() {
+            return false;
+        }
         match self {
             ApiError::Http { status, .. } => matches!(status, 408 | 409 | 425 | 429 | 500..=599),
             ApiError::Network(_) | ApiError::Timeout | ApiError::BadResponse(_) => true,
         }
     }
     pub fn is_auth(&self) -> bool {
-        matches!(self, ApiError::Http { status: 401 | 403, .. })
+        matches!(self, ApiError::Http { status: 401 | 403, .. }) || self.is_quota()
     }
     /// Errors that indicate the provider is unhealthy (count toward the circuit breaker).
     pub fn is_provider_failure(&self) -> bool {
         match self {
-            ApiError::Http { status, .. } => matches!(status, 401 | 403 | 404 | 408 | 429 | 500..=599),
+            ApiError::Http { status, .. } => matches!(status, 401 | 402 | 403 | 404 | 408 | 429 | 500..=599),
             ApiError::Network(_) | ApiError::Timeout => true,
             ApiError::BadResponse(_) => false,
         }
@@ -134,7 +151,13 @@ impl ChatBackend for OpenAiCompat {
                 if e.is_timeout() { ApiError::Timeout } else { ApiError::Network(format!("{e}")) }
             })?;
             let status = resp.status().as_u16();
-            let retry_after = parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER));
+            let retry_after = resp
+                .headers()
+                .get("retry-after-ms")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .or_else(|| parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER)));
             let text = resp.text().await.map_err(|e| {
                 if e.is_timeout() { ApiError::Timeout } else { ApiError::Network(format!("{e}")) }
             })?;
@@ -191,6 +214,26 @@ pub fn clean_model_output(s: &str) -> String {
         trimmed
     };
     trimmed.to_string()
+}
+
+/// Parse `<seg id="N">…</seg>` blocks. Unclosed (truncated) trailing blocks are ignored.
+pub fn parse_seg_tags(answer: &str) -> Option<Vec<(usize, String)>> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)<seg\s+id\s*=\s*["']?(\d+)["']?\s*>(.*?)</seg\s*>"#).unwrap()
+    });
+    let cleaned = clean_model_output(answer);
+    let mut out = Vec::new();
+    for c in RE.captures_iter(&cleaned) {
+        if let Ok(id) = c[1].parse::<usize>() {
+            out.push((id, c[2].trim().to_string()));
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Parse a model answer in either the tag or the JSON format.
+pub fn parse_any(answer: &str) -> Option<Vec<(usize, String)>> {
+    parse_seg_tags(answer).or_else(|| parse_translations(answer))
 }
 
 /// Parse translations from a model answer: accepts {"translations":[{id,text}]},
@@ -277,6 +320,25 @@ mod tests {
         assert_eq!(clean_model_output("<think>hmm\nlet me</think>\n```json\n{\"a\":1}\n```"), "{\"a\":1}");
         assert_eq!(clean_model_output("reasoning...</think>{\"a\":1}"), "{\"a\":1}");
         assert_eq!(clean_model_output("{\"a\":1}"), "{\"a\":1}");
+    }
+
+    #[test]
+    fn parses_seg_tags() {
+        let a = parse_any("<think>x</think>Here:\n<seg id=\"1\">你好 <g1>世界</g1></seg>\n<seg id='2'>再见</seg>\n<seg id=\"3\">trunc").unwrap();
+        assert_eq!(a, vec![(1, "你好 <g1>世界</g1>".to_string()), (2, "再见".to_string())]);
+        let b = parse_any("<seg id=5>\nmulti\nline\n</seg>").unwrap();
+        assert_eq!(b, vec![(5, "multi\nline".to_string())]);
+        assert!(parse_any("nothing").is_none());
+        assert!(parse_any(r#"{"translations":[{"id":1,"text":"x"}]}"#).is_some());
+    }
+
+    #[test]
+    fn quota_errors_not_transient() {
+        let e = ApiError::Http { status: 429, body: "{\"error\":{\"code\":\"insufficient_quota\"}}".into(), retry_after: None };
+        assert!(!e.is_transient());
+        assert!(e.is_auth());
+        let e2 = ApiError::Http { status: 429, body: "rate limited".into(), retry_after: None };
+        assert!(e2.is_transient());
     }
 
     #[test]

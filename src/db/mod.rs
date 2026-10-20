@@ -107,6 +107,10 @@ impl Db {
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if current == 0 {
+        // Must be set before the first table is created; enables incremental_vacuum.
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+    }
     for (idx, sql) in MIGRATIONS.iter().enumerate() {
         let version = (idx + 1) as i64;
         if version <= current {
