@@ -5,7 +5,7 @@
 <div class="card">
 <form method="post" action="/admin/categories" class="row">
   <input type="hidden" name="csrf" value="{{ base.csrf }}">
-  <div><label>新分类</label><input type="text" name="name" required></div>
+  <div><label for="cat_new">新分类</label><input type="text" id="cat_new" name="name" required></div>
   <div class="shrink"><button>创建</button></div>
 </form>
 </div>

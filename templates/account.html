@@ -7,8 +7,8 @@
   <form method="post" action="/admin/account/password">
     <input type="hidden" name="csrf" value="{{ base.csrf }}">
     <div class="fields">
-      <div><label>当前密码</label><input type="password" name="current" required autocomplete="current-password"></div>
-      <div><label>新密码（至少 8 位）</label><input type="password" name="new" required minlength="8" autocomplete="new-password"></div>
+      <div><label for="pw_cur">当前密码</label><input type="password" id="pw_cur" name="current" required autocomplete="current-password"></div>
+      <div><label for="pw_new">新密码（至少 8 位）</label><input type="password" id="pw_new" name="new" required minlength="8" autocomplete="new-password"></div>
     </div>
     <div class="help">修改后所有网页会话失效；若未设置 API 专用密码，阅读器也需要重新登录。</div>
     <div class="actions"><button>修改</button></div>
@@ -19,7 +19,7 @@
   <p class="small">当前：{% if api_password %}<b>已设置</b>，阅读器需使用该密码登录{% else %}未设置，阅读器使用管理密码登录{% endif %}。建议为手机阅读器设置单独的密码。</p>
   <form method="post" action="/admin/account/api-password">
     <input type="hidden" name="csrf" value="{{ base.csrf }}">
-    <div class="fields"><div><label>新的 API 密码（留空表示取消，改回使用管理密码）</label><input type="password" name="password" minlength="8" autocomplete="new-password"></div></div>
+    <div class="fields"><div><label for="pw_api">新的 API 密码（留空表示取消，改回使用管理密码）</label><input type="password" id="pw_api" name="password" minlength="8" autocomplete="new-password"></div></div>
     <div class="help">保存后所有阅读器的登录令牌都会失效，需要重新登录。</div>
     <div class="actions"><button>保存</button></div>
   </form>

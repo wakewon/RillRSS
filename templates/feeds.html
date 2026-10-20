@@ -6,11 +6,11 @@
   <form method="post" action="/admin/feeds">
     <input type="hidden" name="csrf" value="{{ base.csrf }}">
     <div class="row">
-      <div><label>订阅地址（RSS/Atom/JSON Feed 或网页地址）</label><input type="url" name="url" required placeholder="https://example.com/feed.xml"></div>
-      <div class="shrink" style="min-width:150px"><label>分类</label>
-        <select name="category"><option value="">（未分类）</option>{% for c in categories %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div>
-      <div class="shrink" style="min-width:180px"><label>预设</label>
-        <select name="preset">
+      <div><label for="add_url">订阅地址（RSS/Atom/JSON Feed 或网页地址）</label><input type="url" id="add_url" name="url" required placeholder="https://example.com/feed.xml"></div>
+      <div class="shrink" style="min-width:150px"><label for="add_cat">分类</label>
+        <select id="add_cat" name="category"><option value="">（未分类）</option>{% for c in categories %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div>
+      <div class="shrink" style="min-width:180px"><label for="add_preset">预设</label>
+        <select id="add_preset" name="preset">
           <option value="plain">仅订阅</option>
           <option value="fulltext">全文提取</option>
           <option value="fulltext_tr">全文 + 翻译</option>
