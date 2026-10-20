@@ -96,11 +96,11 @@ pub struct RetentionSettings {
 impl Default for RetentionSettings {
     fn default() -> Self {
         RetentionSettings {
-            days: 30,
+            days: 14,
             keep_unread: false,
             max_items_per_feed: 0,
-            superseded_days: 31,
-            translation_cache_days: 60,
+            superseded_days: 14,
+            translation_cache_days: 30,
             event_rows: 5000,
         }
     }
@@ -187,7 +187,9 @@ impl TranslationSettings {
 pub struct ImageSettings {
     pub max_mb: u32,
     pub max_per_article: u32,
-    /// Stop caching new images when the cache exceeds this size (MB). 0 = unlimited.
+    /// Cache size cap (MB). Past it the images of the oldest articles are dropped (those
+    /// articles point at the original images again); new images are still cached.
+    /// 0 = unlimited.
     pub max_total_mb: u32,
     pub timeout_secs: u32,
     pub concurrency: u32,

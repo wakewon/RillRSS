@@ -1749,7 +1749,7 @@ fn settings_sections(s: &Settings) -> Vec<Section> {
             fields: vec![
                 n("images.max_mb", "单张图片上限（MB）", &s.images.max_mb, ""),
                 n("images.max_per_article", "每篇最多图片数", &s.images.max_per_article, ""),
-                n("images.max_total_mb", "缓存总上限（MB）", &s.images.max_total_mb, "超过后新图片保留原地址；0 表示不限制"),
+                n("images.max_total_mb", "缓存总上限（MB）", &s.images.max_total_mb, "超过后删除最旧文章的缓存图片（这些文章改回原图地址），新图片照常缓存；0 表示不限制"),
                 n("images.timeout_secs", "下载超时（秒）", &s.images.timeout_secs, ""),
                 n("images.concurrency", "每篇并发下载数", &s.images.concurrency, ""),
                 n("images.min_dimension", "过滤小于 N 像素的跟踪图", &s.images.min_dimension, ""),
@@ -1782,11 +1782,11 @@ fn settings_sections(s: &Settings) -> Vec<Section> {
             title: "保留与清理".into(),
             help: "收藏的文章永不删除。".into(),
             fields: vec![
-                n("retention.days", "文章保留天数", &s.retention.days, "0 表示永久保留"),
+                n("retention.days", "文章保留天数", &s.retention.days, "按收到时间计算；收藏不会被删除；0 表示永久保留"),
                 check("retention.keep_unread", "保留未读文章", s.retention.keep_unread, ""),
                 n("retention.max_items_per_feed", "每个订阅最多文章数", &s.retention.max_items_per_feed, "0 表示不限制"),
-                n("retention.superseded_days", "旧版本保留天数", &s.retention.superseded_days, "建议 ≥ 31，便于客户端同步已读状态"),
-                n("retention.translation_cache_days", "翻译缓存保留天数", &s.retention.translation_cache_days, ""),
+                n("retention.superseded_days", "旧版本保留天数", &s.retention.superseded_days, "新闻更新后被取代的旧版本（已标为已读）；超过文章保留天数时以后者为准"),
+                n("retention.translation_cache_days", "翻译缓存保留天数", &s.retention.translation_cache_days, "超过该天数未再使用的译文会被删除"),
                 n("retention.event_rows", "日志保留条数", &s.retention.event_rows, ""),
             ],
         },

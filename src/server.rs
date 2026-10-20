@@ -134,7 +134,23 @@ async fn image(State(app): State<AppRef>, Path((prefix, name)): Path<(String, St
             h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
             r
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => {
+            // Dropped from the cache (size cap): send copies that clients still have to
+            // the original image.
+            let hash = &name[..name.find('.').unwrap_or(name.len())];
+            match app.images.source_url(hash).await.ok().flatten().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+                Some(url) => match HeaderValue::from_str(&url) {
+                    Ok(location) => {
+                        let mut r = StatusCode::FOUND.into_response();
+                        r.headers_mut().insert(header::LOCATION, location);
+                        r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+                        r
+                    }
+                    Err(_) => StatusCode::NOT_FOUND.into_response(),
+                },
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
     }
 }
 

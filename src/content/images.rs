@@ -3,12 +3,13 @@
 //!
 //! Safety limits: http(s) only, public addresses only (unless allowed), size cap,
 //! magic-byte type check (raster formats only — SVG is never cached), tracking-pixel
-//! removal, per-article image cap, per-host politeness and a total cache size cap.
+//! removal, per-article image cap and per-host politeness. Past the total size cap the
+//! images of the oldest articles are dropped (see `ImageStore::evict`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -27,6 +28,8 @@ pub struct ImageStore {
     pub dir: PathBuf,
     db: Db,
     total_bytes: Arc<AtomicI64>,
+    /// An eviction (see `evict`) is running in the background.
+    evicting: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -89,7 +92,7 @@ impl ImageStore {
     pub fn new(dir: PathBuf, db: Db) -> Result<ImageStore> {
         std::fs::create_dir_all(&dir)?;
         let total: i64 = db.conn()?.query_row("SELECT COALESCE(SUM(size), 0) FROM images", [], |r| r.get(0))?;
-        Ok(ImageStore { dir, db, total_bytes: Arc::new(AtomicI64::new(total)) })
+        Ok(ImageStore { dir, db, total_bytes: Arc::new(AtomicI64::new(total)), evicting: Arc::new(AtomicBool::new(false)) })
     }
 
     pub fn file_path(&self, hash: &str, ext: &str) -> PathBuf {
@@ -173,10 +176,6 @@ impl ImageStore {
             } else if status != "ok" && *attempts >= 3 && util::now() - fetched_at < 7 * 86400 {
                 bail!("previously failed {attempts} times");
             }
-        }
-
-        if cfg.max_total_mb > 0 && self.total_bytes() > cfg.max_total_mb as i64 * 1024 * 1024 {
-            bail!("image cache is full ({} MB limit)", cfg.max_total_mb);
         }
 
         let result = self.download(http, cfg, url, referer, user_agent).await;
@@ -334,7 +333,121 @@ impl ImageStore {
             }
         }
         out.html = fragment_html(&doc);
+        if cfg.max_total_mb > 0 {
+            self.evict_in_background(cfg.max_total_mb as i64 * 1024 * 1024);
+        }
         Ok(out)
+    }
+
+    /// Start `evict` unless the cache is within `max_bytes` or one is running already.
+    fn evict_in_background(&self, max_bytes: i64) {
+        if self.total_bytes() <= max_bytes || self.evicting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let store = self.clone();
+        tokio::spawn(async move {
+            match store.evict(max_bytes).await {
+                Ok((0, _)) => {}
+                Ok((n, freed)) => tracing::info!("image cache over its limit: dropped {n} images of the oldest articles ({freed} bytes)"),
+                Err(e) => tracing::warn!("image cache eviction failed: {e:#}"),
+            }
+            store.evicting.store(false, Ordering::Release);
+        });
+    }
+
+    /// Bring the cache under `max_bytes`, down to 90% of it so that this does not run
+    /// for every new image. Images whose newest article is oldest go first, those of
+    /// starred articles last. Articles that used a dropped image get its original
+    /// address back, and `/img/` redirects there for copies clients already have.
+    /// Returns (images dropped, bytes freed).
+    pub async fn evict(&self, max_bytes: i64) -> Result<(usize, i64)> {
+        let target = max_bytes / 10 * 9;
+        let (mut dropped, mut freed) = (0usize, 0i64);
+        while max_bytes > 0 && self.total_bytes() > target {
+            let young = util::now() - 86400;
+            let batch: Vec<(String, String, i64)> = self
+                .db
+                .call(move |c| {
+                    // An unreferenced new image may belong to an article still being
+                    // processed. Without a known source an image could not be restored.
+                    let mut st = c.prepare(
+                        "SELECT i.hash, i.ext, i.size FROM images i
+                         LEFT JOIN item_images ii ON ii.hash = i.hash
+                         LEFT JOIN items it ON it.id = ii.item_id
+                         WHERE EXISTS (SELECT 1 FROM image_sources s WHERE s.hash = i.hash AND s.status = 'ok')
+                         GROUP BY i.hash
+                         HAVING COUNT(it.id) > 0 OR i.created_at < ?
+                         ORDER BY COALESCE(MAX(it.is_starred), 0), MAX(i.created_at * 1000000, COALESCE(MAX(it.created_at), 0))
+                         LIMIT 100",
+                    )?;
+                    let v = st.query_map([young], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(v)
+                })
+                .await?;
+            let mut progressed = false;
+            for (hash, ext, size) in batch {
+                if self.total_bytes() <= target {
+                    break;
+                }
+                if self.drop_image(&hash, &ext, size).await? {
+                    dropped += 1;
+                    freed += size;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok((dropped, freed))
+    }
+
+    /// Remove one image from the cache and point the articles using it at its original
+    /// address. False when it is gone already or its source is unknown.
+    async fn drop_image(&self, hash: &str, ext: &str, size: i64) -> Result<bool> {
+        let cached = format!("{BASE_MARKER}{}", public_path(hash, ext));
+        let (h, now) = (hash.to_string(), util::now());
+        let dropped = self
+            .db
+            .write(move |tx| {
+                let original: Option<String> = tx
+                    .query_row("SELECT url FROM image_sources WHERE hash = ? AND status = 'ok' ORDER BY fetched_at DESC LIMIT 1", [&h], |r| r.get(0))
+                    .optional()?;
+                let Some(original) = original else { return Ok(false) };
+                let original = html_escape::encode_double_quoted_attribute(&original).into_owned();
+                let items: Vec<i64> = {
+                    let mut st = tx.prepare("SELECT item_id FROM item_images WHERE hash = ?")?;
+                    st.query_map([&h], |r| r.get(0))?.collect::<Result<_, _>>()?
+                };
+                for id in items {
+                    let content: String = tx.query_row("SELECT content FROM items WHERE id = ?", [id], |r| r.get(0))?;
+                    if content.contains(&cached) {
+                        tx.execute("UPDATE items SET content = ? WHERE id = ?", params![content.replace(&cached, &original), id])?;
+                    }
+                }
+                tx.execute("DELETE FROM item_images WHERE hash = ?", [&h])?;
+                // The source row stays (as of now) for the `/img/` redirect; maintenance
+                // drops it later.
+                tx.execute("UPDATE image_sources SET fetched_at = ? WHERE hash = ? AND status = 'ok'", params![now, h])?;
+                Ok(tx.execute("DELETE FROM images WHERE hash = ?", [&h])? > 0)
+            })
+            .await?;
+        if dropped {
+            let _ = tokio::fs::remove_file(self.file_path(hash, ext)).await;
+            self.sub_bytes(size);
+        }
+        Ok(dropped)
+    }
+
+    /// Original address of a cached (or dropped) image.
+    pub async fn source_url(&self, hash: &str) -> Result<Option<String>> {
+        let h = hash.to_string();
+        self.db
+            .call(move |c| {
+                Ok(c.query_row("SELECT url FROM image_sources WHERE hash = ? AND status = 'ok' ORDER BY fetched_at DESC LIMIT 1", [h], |r| r.get(0))
+                    .optional()?)
+            })
+            .await
     }
 
     /// Delete images no longer referenced by any item (older than `grace_secs`).

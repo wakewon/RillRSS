@@ -19,6 +19,8 @@ pub struct CleanupReport {
     pub stories_deleted: usize,
     pub images_deleted: usize,
     pub image_bytes_freed: i64,
+    /// Dropped to stay under the cache size cap (their articles use the originals again).
+    pub images_evicted: usize,
     pub translations_deleted: usize,
     pub events_deleted: usize,
     pub sessions_deleted: usize,
@@ -27,13 +29,14 @@ pub struct CleanupReport {
 impl CleanupReport {
     pub fn summary(&self) -> String {
         format!(
-            "删除文章 {}、旧版本 {}、处理记录 {}、新闻条目 {}、图片 {}（{}）、翻译缓存 {}、日志 {}、会话 {}",
+            "删除文章 {}、旧版本 {}、处理记录 {}、新闻条目 {}、图片 {}（{}{}）、翻译缓存 {}、日志 {}、会话 {}",
             self.items_deleted,
             self.superseded_deleted,
             self.revisions_deleted,
             self.stories_deleted,
-            self.images_deleted,
+            self.images_deleted + self.images_evicted,
             util::human_bytes(self.image_bytes_freed.max(0) as u64),
+            if self.images_evicted > 0 { format!("，其中 {} 张因超出缓存上限，相关文章改回原图地址", self.images_evicted) } else { String::new() },
             self.translations_deleted,
             self.events_deleted,
             self.sessions_deleted
@@ -52,7 +55,7 @@ pub async fn run_maintenance(app: AppRef) {
         delay = Duration::from_secs(3600);
         match cleanup(&app).await {
             Ok(r) => {
-                if r.items_deleted + r.superseded_deleted + r.images_deleted + r.stories_deleted > 0 {
+                if r.items_deleted + r.superseded_deleted + r.images_deleted + r.images_evicted + r.stories_deleted > 0 {
                     app.event(Level::Info, "cleanup", EventRef::default(), r.summary()).await;
                 }
             }
@@ -158,9 +161,21 @@ pub async fn cleanup(app: &AppRef) -> Result<CleanupReport> {
     let (n, freed) = app.images.gc(86400).await?;
     report.images_deleted = n;
     report.image_bytes_freed = freed;
-    let failed_cutoff = now - 30 * 86400;
+    let cap = settings.images.max_total_mb as i64 * 1024 * 1024;
+    let (n, freed) = app.images.evict(cap).await?;
+    report.images_evicted = n;
+    report.image_bytes_freed += freed;
+    // Failed downloads, and sources of dropped images (kept for a while so that `/img/`
+    // can redirect copies that clients already have).
+    let sources_cutoff = now - 30 * 86400;
     app.db
-        .call(move |c| Ok(c.execute("DELETE FROM image_sources WHERE status <> 'ok' AND fetched_at < ?", [failed_cutoff])?))
+        .call(move |c| {
+            Ok(c.execute(
+                "DELETE FROM image_sources WHERE fetched_at < ?
+                   AND (status <> 'ok' OR NOT EXISTS (SELECT 1 FROM images i WHERE i.hash = image_sources.hash))",
+                [sources_cutoff],
+            )?)
+        })
         .await?;
 
     // Translation cache.
