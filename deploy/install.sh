@@ -239,7 +239,7 @@ taken). Then start it with:
   cd $INSTALL_DIR && docker compose up -d
 
 Later releases install with:
-  sudo $INSTALL_DIR/update.sh /path/to/rillrss-VERSION-linux-amd64.tar.gz
+  sudo $INSTALL_DIR/update.sh /path/to/rillrss-VERSION-linux-$PACKAGE_ARCH.tar.gz
 EOF
     exit 0
 fi

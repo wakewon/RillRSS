@@ -16,7 +16,7 @@ git push origin main --follow-tags
 
 [Release 工作流](https://github.com/wakewon/RillRSS/actions/workflows/release.yml) 校验 tag、Cargo.toml 和 Cargo.lock 的版本一致；不一致时立即失败。它会：
 
-- 运行 Rust 格式检查、单元测试和集成测试，使用 `--locked` 保持依赖版本。
+- 运行 Rust 单元测试和集成测试，使用 `--locked` 保持依赖版本。
 - 在 `ubuntu-24.04`（amd64）和 `ubuntu-24.04-arm`（arm64）上分别原生构建 Docker 镜像；依赖与 Docker 层缓存在 GitHub，本机不参与编译。
 - 每种架构验证程序版本、服务启动、HTTP 健康检查、数据库完整性和在线备份。
 - 生成并校验离线安装包，验证安装器能在对应架构上导入镜像并完成首次安装。

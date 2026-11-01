@@ -178,7 +178,7 @@ docker pull ghcr.io/wakewon/rillrss:0.1.4
 
 ## 开发
 
-日常提交和 PR 会自动运行 GitHub Actions CI（格式检查、单元测试与集成测试）；打版本 tag 后会完成测试、Docker 编译和发布。本机只需编辑代码和推送，不会产生 `target/` 或 Docker 编译缓存。
+日常提交和 PR 会自动运行 GitHub Actions CI（单元测试与集成测试）；打版本 tag 后会完成测试、Docker 编译和发布。本机只需编辑代码和推送，不会产生 `target/` 或 Docker 编译缓存。
 
 确需本地调试时：
 
