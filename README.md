@@ -2,7 +2,7 @@
 
 轻量、高效、稳定的自托管 RSS 聚合与内容处理服务。主要面向移动端阅读器使用：兼容 **Google Reader / FreshRSS API**（含 TT-RSS FreshAPI 路径）与 **TT-RSS API**（含 News+ 扩展），并在服务端完成**全文提取、繁简转换、翻译（AI / Google / 微软）、图片缓存**，以及对持续修订的新闻进行**更新检测与重新发布**。
 
-- 单个 Rust 二进制 + SQLite，无 Redis / 消息队列 / 外部依赖；Docker 镜像支持 amd64 与 arm64。
+- 使用 Rust 与 SQLite，无需 Redis 或消息队列；提供 amd64 / arm64 Docker 镜像。
 - 只有简洁的 Web 管理后台（配置、订阅管理、任务状态、诊断），不含网页阅读器；单用户。
 
 ---
@@ -26,6 +26,8 @@
 ---
 
 ## 部署
+
+统一使用 Docker 部署：推荐直接拉取预构建镜像，离线安装包用于将同一镜像搬运到服务器。
 
 ### 方式一：拉取预构建 Docker 镜像（推荐）
 
@@ -228,7 +230,7 @@ docker pull ghcr.io/wakewon/rillrss:0.1.4
 
 日常提交和 PR 会自动运行 GitHub Actions CI（单元测试与集成测试）；打版本 tag 后会完成测试、Docker 编译和发布。本机只需编辑代码和推送，不会产生 `target/` 或 Docker 编译缓存。
 
-确需本地调试时：
+以下源码构建命令仅用于开发调试，日常部署请使用上面的 Docker 镜像：
 
 ```bash
 cargo build --release
