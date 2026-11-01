@@ -25,27 +25,75 @@
 
 ---
 
-## 快速开始（Docker Compose）
+## 部署
+
+### 方式一：拉取预构建 Docker 镜像（推荐）
+
+安装 Docker 和 Docker Compose v2 或更新版本后，只需下载两个配置文件即可部署。镜像由 GitHub Actions 编译，支持 amd64 / arm64，Docker 会自动选择服务器对应的架构。
+
+**1. 准备配置文件**
 
 ```bash
-git clone https://github.com/wakewon/RillRSS.git rillrss && cd rillrss
-cp .env.example .env          # 修改 RILL_PASSWORD 等
+mkdir -p rillrss && cd rillrss
+curl -fL https://raw.githubusercontent.com/wakewon/RillRSS/main/docker-compose.yml -o compose.yml
+curl -fL https://raw.githubusercontent.com/wakewon/RillRSS/main/.env.example -o .env
+```
+
+**2. 修改 `.env`**
+
+用文本编辑器打开 `.env`，将 `RILL_PASSWORD` 改为自己的强密码。如果通过域名访问，将 `RILL_BASE_URL` 设为公开地址；暂时只用 IP 访问时可以留空。保留 `RILL_VERSION=latest` 即使用最新稳定版：
+
+```dotenv
+RILL_USERNAME=admin
+RILL_PASSWORD=替换为你自己的强密码
+RILL_BASE_URL=
+RILL_VERSION=latest
+```
+
+`RILL_PORT` 默认是 `8080`，端口已被占用时可在 `.env` 中修改。
+
+**3. 拉取镜像并启动**
+
+```bash
 docker compose pull
 docker compose up -d
 ```
 
-然后访问 `http://服务器:8080/admin`，用 `.env` 中的用户名与密码登录（若未设置密码，首次启动会在日志中打印随机密码：`docker compose logs rillrss`）。
+访问 `http://服务器IP:8080/admin`，用 `.env` 中的用户名与密码登录；修改过 `RILL_PORT` 时使用对应端口。通过域名提供 HTTPS 访问的配置见下方[反向代理](#反向代理https)。
 
 数据（SQLite 数据库与图片缓存）保存在 `./data`。容器以 `PUID`/`PGID`（默认 1000）运行，启动时会自动修正数据目录权限。
 
-默认从 `ghcr.io/wakewon/rillrss:latest` 拉取预构建镜像，Docker 自动选择 amd64 / arm64，无需安装 Rust 或编译。需要固定版本时在 `.env` 设置 `RILL_VERSION=0.1.4`。
+#### 更新在线镜像
 
-生产服务器也可使用 [GitHub Releases](https://github.com/wakewon/RillRSS/releases) 中的 amd64 / arm64 离线 Docker 安装包，支持固定安装目录、正式安装和后续一条命令升级，见 [deploy/DEPLOY.zh-CN.md](deploy/DEPLOY.zh-CN.md)。
+在安装目录执行以下命令，即可拉取最新稳定版并更新容器：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+更新会保留 `.env` 和 `data/`，数据库会自动迁移；更新前可按下方[运维](#运维)说明备份数据库。
+
+需要固定版本时，在 `.env` 设置 `RILL_VERSION=0.1.4`，再执行相同命令。可用版本见 [GitHub Releases](https://github.com/wakewon/RillRSS/releases)。以上部署与更新流程均无需下载源码、安装 Rust 或本地编译。
+
+### 方式二：离线 Docker 安装包
+
+服务器无法直接访问 GHCR，或需要先下载镜像再传到服务器时，可以使用 [GitHub Releases](https://github.com/wakewon/RillRSS/releases) 中的离线安装包。它们同样由 GitHub Actions 编译，包内包含 Docker 镜像、Compose 配置、安装 / 升级脚本和校验文件。
+
+| 服务器架构 | 下载的安装包 |
+|---|---|
+| x86-64 / amd64 | `rillrss-版本号-linux-amd64.tar.gz` 及同名 `.sha256` 文件 |
+| ARM64 / aarch64 | `rillrss-版本号-linux-arm64.tar.gz` 及同名 `.sha256` 文件 |
+
+离线安装默认使用 `/opt/rillrss` 作为固定目录，后续通过上传新发布包并运行 `update.sh` 升级。完整的校验、安装、配置与升级步骤见 [deploy/DEPLOY.zh-CN.md](deploy/DEPLOY.zh-CN.md)。
 
 ### 常用环境变量
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `RILL_VERSION` | `latest` | 在线镜像的版本标签；可改为 `0.1.4` 等已发布版本 |
+| `RILL_PORT` | `8080` | Docker Compose 对外提供服务的宿主机端口 |
+| `RILL_DATA_PATH` | `./data` | Docker Compose 在宿主机保存数据库与图片缓存的目录 |
 | `RILL_USERNAME` | `admin` | 管理与 API 用户名 |
 | `RILL_PASSWORD` | 空 | 首次启动时的初始密码（之后在后台修改） |
 | `RILL_BASE_URL` | 空 | 手机访问到的公开地址（如 `https://rss.example.com`），用于缓存图片的地址；留空则按请求的 Host / X-Forwarded-* 自动推断 |
@@ -156,7 +204,7 @@ location ^~ / {
 - **备份**：运行中可执行 `docker compose exec rillrss entrypoint.sh backup /data/backup-$(date +%F).db`（SQLite 在线备份，得到一致的快照）；或停止容器后复制 `./data` 目录。OPML 导出也包含所有订阅与处理选项。
 - **完整性检查**：`docker compose exec rillrss entrypoint.sh check-db`（输出 `ok` 表示正常）。
 - **不要在容器运行时用宿主机上的工具直接打开数据库**：SQLite 的 WAL 模式依赖共享内存，宿主机与容器（尤其是 Docker Desktop 的虚拟机文件共享、NAS、网络文件系统）同时访问可能损坏数据库。请使用上面的备份命令。
-- **升级**：`docker compose pull && docker compose up -d`；固定版本的实例先修改 `.env` 中的 `RILL_VERSION`，数据库自动迁移。
+- **升级**：在线镜像执行 `docker compose pull && docker compose up -d`（固定版本的实例先修改 `.env` 中的 `RILL_VERSION`）；离线安装包按[离线部署说明](deploy/DEPLOY.zh-CN.md#升级)更新。数据库会自动迁移。
 - **重置密码**：`docker compose exec rillrss entrypoint.sh reset-password 新密码`（通过 `entrypoint.sh` 执行可保证以服务用户身份运行）。
 - **清理**：每小时自动执行（文章保留天数、每订阅上限、旧版本、过期翻译缓存、无引用图片、日志），也可在「任务」页手动执行。收藏永不删除。默认文章与旧版本各保留 14 天、未再使用的译文保留 30 天；已保存过设置的实例沿用保存的值，在「设置 → 保留与清理」中修改。
 - **图片缓存容量**：超过「缓存总上限」后，按文章从旧到新删除缓存图片（收藏文章的图片最后删除），这些文章改用原图地址，阅读器里已缓存的旧地址也会跳转到原图；新文章的图片照常缓存。

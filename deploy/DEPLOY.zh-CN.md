@@ -1,4 +1,6 @@
-# RillRSS Linux Docker 部署
+# RillRSS 离线 Docker 安装包部署
+
+本文说明离线安装包的使用方式。常规部署推荐直接拉取预构建 Docker 镜像，步骤见[仓库 README](https://github.com/wakewon/RillRSS#部署)。
 
 RillRSS 安装在一个固定目录（下文用 `/opt/rillrss`）。该目录保存：
 - `.env`：配置；
