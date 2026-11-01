@@ -73,10 +73,7 @@ while (($#)); do
 done
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || fail "run this script with sudo or as root"
-case "$(uname -m)" in
-    x86_64|amd64) ;;
-    *) fail "this release requires an x86-64 Linux server" ;;
-esac
+[[ $(uname -s) == Linux ]] || fail "this release requires a Linux server"
 command -v docker >/dev/null || fail "Docker is not installed"
 command -v sha256sum >/dev/null || fail "sha256sum is required"
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
@@ -87,6 +84,15 @@ for file in image.tar compose.yml .env.example nginx-rillrss.conf DEPLOY.zh-CN.m
 done
 (cd "$PACKAGE_DIR" && sha256sum -c SHA256SUMS >/dev/null) || fail "package checksum mismatch; download the release again"
 NEW_VERSION=$(<"$PACKAGE_DIR/VERSION")
+# Packages made before multi-architecture releases did not have an ARCH file.
+PACKAGE_ARCH=amd64
+if [[ -f "$PACKAGE_DIR/ARCH" ]]; then PACKAGE_ARCH=$(<"$PACKAGE_DIR/ARCH"); fi
+case "$(uname -m)" in
+    x86_64|amd64) HOST_ARCH=amd64 ;;
+    aarch64|arm64) HOST_ARCH=arm64 ;;
+    *) fail "unsupported server architecture: $(uname -m)" ;;
+esac
+[[ $PACKAGE_ARCH == "$HOST_ARCH" ]] || fail "this package is for $PACKAGE_ARCH, but this server is $HOST_ARCH"
 
 mkdir -p "$INSTALL_DIR"
 INSTALL_DIR=$(cd "$INSTALL_DIR" && pwd)
@@ -105,16 +111,17 @@ running_container() {
     fi
 }
 
-# Version from the image tag of a container (rillrss:0.1.2-amd64 -> 0.1.2).
+# Version from an architecture-specific image tag.
 container_version() {
     local image
     image=$(docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null) || image=
     image=${image##*:}
-    printf '%s' "${image%-amd64}"
+    image=${image%-amd64}
+    printf '%s' "${image%-arm64}"
 }
 
 load_image() {
-    info "Loading image rillrss:$NEW_VERSION-amd64"
+    info "Loading image rillrss:$NEW_VERSION-$PACKAGE_ARCH"
     docker load -i "$PACKAGE_DIR/image.tar" >/dev/null
 }
 
@@ -127,6 +134,9 @@ install_release_files() {
     install -m 644 "$PACKAGE_DIR/nginx-rillrss.conf" "$INSTALL_DIR/nginx-rillrss.conf.example"
     install -m 644 "$PACKAGE_DIR/DEPLOY.zh-CN.md" "$INSTALL_DIR/DEPLOY.zh-CN.md"
     install -m 644 "$PACKAGE_DIR/VERSION" "$INSTALL_DIR/VERSION"
+    if [[ -f "$PACKAGE_DIR/ARCH" ]]; then
+        install -m 644 "$PACKAGE_DIR/ARCH" "$INSTALL_DIR/ARCH"
+    fi
     install -m 755 "$PACKAGE_DIR/update.sh" "$INSTALL_DIR/update.sh"
 }
 

@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # RillRSS container image (linux/amd64 and linux/arm64).
-#   docker compose up -d --build
+# Normally built on native amd64/arm64 GitHub Actions runners on version tags.
+# Optional local build: docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 # Multi-arch build (cross-compiles on the build machine, no emulation needed for Rust):
 #   docker buildx build --platform linux/amd64,linux/arm64 -t rillrss:latest .
 

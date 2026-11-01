@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Rust tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-tests-${{ runner.os }}-${{ runner.arch }}-1.99-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-tests-${{ runner.os }}-${{ runner.arch }}-1.99-
+      - name: Check formatting
+        run: cargo +1.99.0 fmt --all -- --check
+      - name: Test
+        run: cargo +1.99.0 test --locked --all-targets
+

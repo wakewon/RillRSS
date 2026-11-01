@@ -28,16 +28,19 @@
 ## 快速开始（Docker Compose）
 
 ```bash
-git clone <this repo> rillrss && cd rillrss
+git clone https://github.com/wakewon/RillRSS.git rillrss && cd rillrss
 cp .env.example .env          # 修改 RILL_PASSWORD 等
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 然后访问 `http://服务器:8080/admin`，用 `.env` 中的用户名与密码登录（若未设置密码，首次启动会在日志中打印随机密码：`docker compose logs rillrss`）。
 
 数据（SQLite 数据库与图片缓存）保存在 `./data`。容器以 `PUID`/`PGID`（默认 1000）运行，启动时会自动修正数据目录权限。
 
-生产服务器上的 x86-64 预构建包支持固定安装目录、正式安装和后续一条命令升级，见 [deploy/DEPLOY.zh-CN.md](deploy/DEPLOY.zh-CN.md)。
+默认从 `ghcr.io/wakewon/rillrss:latest` 拉取预构建镜像，Docker 自动选择 amd64 / arm64，无需安装 Rust 或编译。需要固定版本时在 `.env` 设置 `RILL_VERSION=0.1.4`。
+
+生产服务器也可使用 [GitHub Releases](https://github.com/wakewon/RillRSS/releases) 中的 amd64 / arm64 离线 Docker 安装包，支持固定安装目录、正式安装和后续一条命令升级，见 [deploy/DEPLOY.zh-CN.md](deploy/DEPLOY.zh-CN.md)。
 
 ### 常用环境变量
 
@@ -153,7 +156,7 @@ location ^~ / {
 - **备份**：运行中可执行 `docker compose exec rillrss entrypoint.sh backup /data/backup-$(date +%F).db`（SQLite 在线备份，得到一致的快照）；或停止容器后复制 `./data` 目录。OPML 导出也包含所有订阅与处理选项。
 - **完整性检查**：`docker compose exec rillrss entrypoint.sh check-db`（输出 `ok` 表示正常）。
 - **不要在容器运行时用宿主机上的工具直接打开数据库**：SQLite 的 WAL 模式依赖共享内存，宿主机与容器（尤其是 Docker Desktop 的虚拟机文件共享、NAS、网络文件系统）同时访问可能损坏数据库。请使用上面的备份命令。
-- **升级**：`git pull && docker compose up -d --build`；数据库自动迁移。
+- **升级**：`docker compose pull && docker compose up -d`；固定版本的实例先修改 `.env` 中的 `RILL_VERSION`，数据库自动迁移。
 - **重置密码**：`docker compose exec rillrss entrypoint.sh reset-password 新密码`（通过 `entrypoint.sh` 执行可保证以服务用户身份运行）。
 - **清理**：每小时自动执行（文章保留天数、每订阅上限、旧版本、过期翻译缓存、无引用图片、日志），也可在「任务」页手动执行。收藏永不删除。默认文章与旧版本各保留 14 天、未再使用的译文保留 30 天；已保存过设置的实例沿用保存的值，在「设置 → 保留与清理」中修改。
 - **图片缓存容量**：超过「缓存总上限」后，按文章从旧到新删除缓存图片（收藏文章的图片最后删除），这些文章改用原图地址，阅读器里已缓存的旧地址也会跳转到原图；新文章的图片照常缓存。
@@ -161,18 +164,34 @@ location ^~ / {
 
 ### 多架构镜像
 
+版本 tag 触发 GitHub Actions，在 GitHub 的 amd64 / arm64 原生 runner 上分别编译并验证，再发布一个多架构镜像：
+
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 -t your-registry/rillrss:latest --push .
+docker pull ghcr.io/wakewon/rillrss:0.1.4
 ```
+
+同一地址支持 `linux/amd64`、`linux/arm64`。稳定版另有 `latest` 标签，预发布版（如 `0.1.5-rc.1`）只发布对应版本标签。离线 Docker 安装包与 SHA-256 校验文件同时附在 GitHub Release 中。
+
+发布步骤、两个远端的推送配置与工作流重试方式见 [docs/RELEASING.md](docs/RELEASING.md)。
 
 ---
 
 ## 开发
 
+日常提交和 PR 会自动运行 GitHub Actions CI（格式检查、单元测试与集成测试）；打版本 tag 后会完成测试、Docker 编译和发布。本机只需编辑代码和推送，不会产生 `target/` 或 Docker 编译缓存。
+
+确需本地调试时：
+
 ```bash
 cargo build --release
 RILL_DATA_DIR=./data RILL_PASSWORD=dev-password ./target/release/rillrss
 cargo test            # 单元测试 + 集成测试（内置模拟订阅服务器与模拟 OpenAI 接口）
+```
+
+手动从源码构建 Docker 镜像：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 文档：

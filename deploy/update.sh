@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Upgrade the RillRSS installation this script lives in to a downloaded release:
-#   sudo /opt/rillrss/update.sh /path/to/rillrss-VERSION-linux-amd64.tar.gz
+#   sudo /opt/rillrss/update.sh /path/to/rillrss-VERSION-linux-ARCH.tar.gz
 # The release's own install.sh does the work (backup, image load, restart).
 set -Eeuo pipefail
 umask 077
@@ -11,7 +11,7 @@ fail() {
 }
 
 if (($# != 1)) || [[ ! -f $1 ]]; then
-    printf 'Usage: sudo %s /path/to/rillrss-VERSION-linux-amd64.tar.gz\n' "$0" >&2
+    printf 'Usage: sudo %s /path/to/rillrss-VERSION-linux-ARCH.tar.gz\n' "$0" >&2
     exit 2
 fi
 [[ ${EUID:-$(id -u)} -eq 0 ]] || fail "run this script with sudo or as root"

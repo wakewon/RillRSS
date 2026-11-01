@@ -2,7 +2,7 @@ name: rillrss
 
 services:
   rillrss:
-    image: rillrss:0.1.1-amd64
+    image: rillrss:0.1.4-amd64
     platform: linux/amd64
     container_name: rillrss
     restart: unless-stopped

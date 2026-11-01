@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish (e.g. v0.1.4)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      image: ${{ steps.version.outputs.image }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - name: Validate release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, tomllib
+          from pathlib import Path
+
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?', tag), f'Invalid version tag: {tag}'
+          version = tag[1:]
+          package = tomllib.loads(Path('Cargo.toml').read_text())['package']
+          locked = tomllib.loads(Path('Cargo.lock').read_text())['package']
+          assert package['version'] == version, f"Tag {tag} does not match Cargo.toml {package['version']}"
+          assert any(p['name'] == package['name'] and p['version'] == version for p in locked), 'Cargo.lock version does not match the tag'
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          outputs = {'tag': tag, 'version': version, 'prerelease': str('-' in version).lower(),
+                     'image': 'ghcr.io/' + os.environ['GITHUB_REPOSITORY'].lower(), 'commit': commit}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in outputs.items():
+                  print(f'{key}={value}', file=output)
+          PY
+
+  test:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.commit }}
+
+  build:
+    name: Docker / ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=RillRSS
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,scope=release-${{ matrix.arch }},mode=max
+      - name: Load and smoke test the native image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker pull "$IMAGE@$DIGEST"
+          docker tag "$IMAGE@$DIGEST" "rillrss:$VERSION-$ARCH"
+          scripts/smoke-image.sh "rillrss:$VERSION-$ARCH" "$VERSION"
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s@%s\n' "$IMAGE" "$DIGEST" > "$RUNNER_TEMP/digests/$ARCH.txt"
+      - name: Package the offline installer
+        run: |
+          docker save -o "$RUNNER_TEMP/image.tar" "rillrss:$VERSION-$ARCH"
+          scripts/package-linux.sh "$VERSION" "$ARCH" "$RUNNER_TEMP/image.tar"
+          (cd dist && sha256sum -c ./*.tar.gz.sha256)
+          package="dist/rillrss-$VERSION-linux-$ARCH"
+          (cd "$package" && sha256sum -c SHA256SUMS)
+          sudo "$package/install.sh" --install-dir "$RUNNER_TEMP/install-check"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [prepare, test, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-linux-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-digests-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Stage GitHub Release and upload packages
+        run: |
+          for arch in amd64 arm64; do
+            test -s "dist/rillrss-$VERSION-linux-$arch.tar.gz"
+            test -s "digests/$arch.txt"
+          done
+          (cd dist && sha256sum -c ./*.tar.gz.sha256)
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            printf 'Docker: %s:%s (linux/amd64, linux/arm64).\n\nOffline Docker installers and SHA-256 checksums are attached below. See DEPLOY.zh-CN.md inside each package.\n' "$IMAGE" "$VERSION" > "$RUNNER_TEMP/release-notes.md"
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "RillRSS $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+      - name: Publish and verify the multi-platform image
+        run: |
+          mapfile -t digests < <(cat digests/amd64.txt digests/arm64.txt)
+          tags=(--tag "$IMAGE:$VERSION" --tag "$IMAGE:$RELEASE_TAG")
+          if [[ $PRERELEASE == false ]]; then
+            tags+=(--tag "$IMAGE:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${digests[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" --raw > "$RUNNER_TEMP/manifest.json"
+          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' "$RUNNER_TEMP/manifest.json"
+      - name: Publish GitHub Release
+        run: |
+          latest=true
+          if [[ $PRERELEASE == true ]]; then latest=false; fi
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE" --latest="$latest"
+          {
+            printf '### RillRSS %s\n\n' "$VERSION"
+            printf -- '- Image: %s:%s (linux/amd64, linux/arm64)\n' "$IMAGE" "$VERSION"
+            printf -- '- Release: https://github.com/%s/releases/tag/%s\n' "$GH_REPO" "$RELEASE_TAG"
+          } >> "$GITHUB_STEP_SUMMARY"

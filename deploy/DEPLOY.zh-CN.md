@@ -1,4 +1,4 @@
-# RillRSS x86-64 Docker 部署
+# RillRSS Linux Docker 部署
 
 RillRSS 安装在一个固定目录（下文用 `/opt/rillrss`）。该目录保存：
 - `.env`：配置；
@@ -7,7 +7,9 @@ RillRSS 安装在一个固定目录（下文用 `/opt/rillrss`）。该目录保
 
 升级只替换镜像、`compose.yml` 和几个辅助文件，上面这些都会保留。
 
-服务器需要 Linux x86-64、Docker Engine、Docker Compose v2 和 Nginx。
+服务器需要 Linux x86-64（amd64）或 ARM64（arm64）、Docker Engine、Docker Compose v2 和 Nginx。
+
+发布包由 GitHub Actions 在线编译，从 [GitHub Releases](https://github.com/wakewon/RillRSS/releases) 下载对应架构的 `.tar.gz` 和 `.sha256` 文件。包内包含 Docker 镜像，服务器无需编译，也无需连接镜像仓库。安装器会拒绝架构不匹配的包。
 
 ## 安装
 
@@ -15,10 +17,15 @@ RillRSS 安装在一个固定目录（下文用 `/opt/rillrss`）。该目录保
 
 ```sh
 VERSION=0.1.4
-sha256sum -c "rillrss-${VERSION}-linux-amd64.tar.gz.sha256"
-tar -xzf "rillrss-${VERSION}-linux-amd64.tar.gz"
-sudo "./rillrss-${VERSION}-linux-amd64/install.sh" --install-dir /opt/rillrss
-rm -rf "rillrss-${VERSION}-linux-amd64"
+case "$(uname -m)" in
+    x86_64) ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    *) echo "不支持的服务器架构"; exit 1 ;;
+esac
+sha256sum -c "rillrss-${VERSION}-linux-${ARCH}.tar.gz.sha256"
+tar -xzf "rillrss-${VERSION}-linux-${ARCH}.tar.gz"
+sudo "./rillrss-${VERSION}-linux-${ARCH}/install.sh" --install-dir /opt/rillrss
+rm -rf "rillrss-${VERSION}-linux-${ARCH}"
 ```
 
 首次安装会导入镜像并生成 `/opt/rillrss/.env`，但不会启动服务。编辑 `.env`，至少填写密码和公开地址：
@@ -65,6 +72,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 ```sh
 sudo /opt/rillrss/update.sh /path/to/rillrss-新版本-linux-amd64.tar.gz
+# ARM64 服务器使用 rillrss-新版本-linux-arm64.tar.gz
 ```
 
 更新器依次：

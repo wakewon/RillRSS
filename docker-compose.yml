@@ -1,10 +1,8 @@
-# RillRSS — docker compose up -d --build
+# RillRSS — docker compose pull && docker compose up -d
 # Configure through a .env file next to this file (see .env.example).
 services:
   rillrss:
-    build:
-      context: .
-    image: rillrss:latest
+    image: ghcr.io/wakewon/rillrss:${RILL_VERSION:-latest}
     container_name: rillrss
     restart: unless-stopped
     ports:
